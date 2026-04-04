@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Linux build and test
+  # ─────────────────────────────────────────────────────────────────────────
+  build-linux:
+    name: Build & Test (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y gcc make
+
+      - name: Build
+        run: make
+
+      - name: Run tests
+        run: make test
+
+      - name: Smoke test — version
+        run: ./guardian version
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardian-linux-x86_64
+          path: guardian
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Windows build and test (MinGW via MSYS2)
+  # ─────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Build & Test (Windows)
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 + MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+
+      - name: Build
+        run: make
+
+      - name: Run tests
+        run: make test
+
+      - name: Smoke test — version
+        run: ./guardian.exe version
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardian-windows-x86_64
+          path: guardian.exe
+          if-no-files-found: error

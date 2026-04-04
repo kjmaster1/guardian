@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build release binaries for all platforms, then publish a GitHub Release
+  # ─────────────────────────────────────────────────────────────────────────
+
+  build-linux:
+    name: Build Linux binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc make
+      - run: make
+      - name: Rename for release
+        run: cp guardian guardian-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guardian-linux-x86_64
+          path: guardian-linux-x86_64
+
+  build-windows:
+    name: Build Windows binary
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc make
+      - run: make
+      - name: Rename for release
+        run: cp guardian.exe guardian-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guardian-windows-x86_64.exe
+          path: guardian-windows-x86_64.exe
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/guardian-linux-x86_64/guardian-linux-x86_64
+            dist/guardian-windows-x86_64.exe/guardian-windows-x86_64.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

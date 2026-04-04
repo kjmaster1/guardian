@@ -1,0 +1,40 @@
+# Build artifacts
+guardian
+guardian.exe
+guardian_test
+guardian_test.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Test-run configs (local, contain machine-specific paths)
+test.ini
+test-crash.ini
+test-logs.ini
+test-health.ini
+test-logs-linux.ini
+test-crash-linux.ini
+test-health-linux.ini
+test-linux.ini
+
+# Log files generated during testing
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*~
+*.orig
+.ccls-cache/
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini

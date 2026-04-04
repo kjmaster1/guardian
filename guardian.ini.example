@@ -1,0 +1,136 @@
+; guardian.ini.example — Example configuration file for guardian
+;
+; Copy this file to guardian.ini and edit it to match your services.
+; Lines starting with ; or # are comments and are ignored.
+;
+; Usage: guardian start guardian.ini
+;
+; =============================================================================
+; [supervisor] — Global settings for the guardian process itself
+; =============================================================================
+
+[supervisor]
+; Path to write log output. If omitted, logs go to stdout only.
+; The file is opened in append mode — logs are preserved across restarts.
+log_file   = /var/log/guardian.log
+
+; Path to the IPC socket used by 'guardian stop' and 'guardian status'.
+; On Linux/macOS this is a Unix domain socket file.
+; On Windows this is a Named Pipe (e.g., \\.\pipe\guardian).
+ipc_socket = /tmp/guardian.sock
+
+
+; =============================================================================
+; [service-name] — A managed process
+;
+; The section name (e.g., "web-api") becomes the display name.
+; You can define up to 64 services.
+; =============================================================================
+
+[web-api]
+; Required: the full path to the executable to run.
+command     = /opt/myapp/api-server
+
+; Optional: command-line arguments passed to the executable.
+args        = --port 8080 --env production
+
+; Optional: the working directory to set before launching.
+; Defaults to the directory guardian was launched from.
+working_dir = /opt/myapp
+
+; Optional: environment variables to inject into the process.
+; Format: KEY1=VALUE1,KEY2=VALUE2 (comma-separated, no spaces around =)
+env         = NODE_ENV=production,LOG_LEVEL=info
+
+; Optional: redirect the process's stdout to this file.
+; If omitted, the process's stdout goes to guardian's stdout.
+stdout_log  = /var/log/web-api.log
+
+; Optional: redirect the process's stderr to this file.
+stderr_log  = /var/log/web-api-err.log
+
+; Optional: start this service automatically when guardian launches.
+; Default: true
+autostart   = true
+
+; Optional: when to restart the process after it exits.
+;   never       — never restart (use for one-shot jobs)
+;   on_failure  — restart only if exit code != 0 or killed by signal (default)
+;   always      — always restart, even on clean exit(0)
+restart     = on_failure
+
+; Optional: maximum number of restart attempts before giving up.
+; Set to 0 for unlimited retries. Default: 5
+max_retries = 5
+
+; Optional: initial delay before the first restart attempt (milliseconds).
+; The delay doubles on each retry (exponential backoff). Default: 1000
+backoff_base_ms = 1000
+
+; Optional: maximum delay between restart attempts (milliseconds).
+; The backoff is capped at this value. Default: 60000 (60 seconds)
+backoff_max_ms  = 60000
+
+; Backoff progression with base=1000, max=60000:
+;   Retry 1: wait 1s
+;   Retry 2: wait 2s
+;   Retry 3: wait 4s
+;   Retry 4: wait 8s
+;   Retry 5: wait 16s  (or give up if max_retries = 5)
+
+; A [health_check] section immediately following a service attaches to it.
+[health_check]
+; Type of health check:
+;   tcp     — attempt a TCP connection to host:port
+;   http    — perform an HTTP GET and check for a 2xx response
+;   command — run a command; exit(0) = healthy, exit(non-zero) = unhealthy
+type        = http
+
+; The target for the check (format depends on type):
+;   tcp:     "host:port"         e.g., 127.0.0.1:8080
+;   http:    "http://..."        e.g., http://127.0.0.1:8080/health
+;   command: "/path/to/script"   e.g., /opt/scripts/check.sh
+target      = http://127.0.0.1:8080/healthz
+
+; How often to run the health check, in seconds. Default: 10
+interval_s  = 10
+
+; How long to wait for the check to complete before marking it as failed.
+; In seconds. Default: 3
+timeout_s   = 3
+
+; How many consecutive failed checks before triggering a restart.
+; A single blip won't cause a restart. Default: 3
+unhealthy_threshold = 3
+
+
+; =============================================================================
+; A second service example — database with TCP health check
+; =============================================================================
+
+[database]
+command     = /usr/bin/postgres
+args        = -D /var/lib/postgres/data
+working_dir = /var/lib/postgres
+autostart   = true
+restart     = always
+max_retries = 0                 ; unlimited — database should never stay down
+
+[health_check]
+type        = tcp
+target      = 127.0.0.1:5432
+interval_s  = 15
+timeout_s   = 2
+unhealthy_threshold = 2
+
+
+; =============================================================================
+; A one-shot job example — runs once, never restarts
+; =============================================================================
+
+[db-migrate]
+command     = /opt/myapp/migrate
+args        = --direction up
+working_dir = /opt/myapp
+autostart   = true
+restart     = never             ; run once on startup, do not restart
