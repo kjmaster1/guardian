@@ -1,6 +1,6 @@
 # guardian
 
-[![CI](https://github.com/kurti/guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/kurti/guardian/actions/workflows/ci.yml)
+[![CI](https://github.com/kjmaster1/guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/kjmaster1/guardian/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A lightweight, cross-platform process supervisor written in C11.
