@@ -3,6 +3,14 @@ guardian
 guardian.exe
 guardian_test
 guardian_test.exe
+guardian_test_config
+guardian_test_config.exe
+guardian_test_service
+guardian_test_service.exe
+guardian_test_logger
+guardian_test_logger.exe
+guardian_test_health
+guardian_test_health.exe
 *.o
 *.obj
 *.pdb

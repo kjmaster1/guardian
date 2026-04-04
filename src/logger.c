@@ -127,17 +127,38 @@ void logger_write(LogLevel level, const char *service, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
 
+    /*
+     * va_copy MUST happen BEFORE the first vfprintf call.
+     *
+     * vfprintf() advances and consumes the va_list as it reads arguments.
+     * After it returns, 'args' is exhausted — calling va_copy on a consumed
+     * va_list is undefined behaviour. On Linux/x86-64 the va_list holds
+     * register-save offsets that are advanced past the argument area, so a
+     * copy of the exhausted list yields garbage values when reused.
+     *
+     * Correct order: copy first, use the original for stdout, use the copy
+     * for the file. Both start fresh and consume their arguments exactly once.
+     *
+     * Why did this go unnoticed on Windows? MinGW implements va_list as a
+     * plain char* that happens to remain pointing at the argument memory
+     * after the call, so the copy "works by accident" for simple types.
+     * That is still undefined behaviour — a lucky accident on one ABI.
+     */
+    va_list args_file;
+    int write_to_file = (g_log_file != NULL);
+    if (write_to_file) {
+        va_copy(args_file, args);  /* copy before ANY vfprintf call */
+    }
+
     /* Write to stdout always */
     fprintf(stdout, "[%s][%s][%s] ", LEVEL_LABELS[level], svc_field, timestamp);
     vfprintf(stdout, fmt, args);
     fprintf(stdout, "\n");
 
     /* Write to file if configured */
-    if (g_log_file != NULL) {
-        va_list args_copy;
-        va_copy(args_copy, args);  /* must copy — args is already partially consumed */
+    if (write_to_file) {
         fprintf(g_log_file, "[%s][%s][%s] ", LEVEL_LABELS[level], svc_field, timestamp);
-        vfprintf(g_log_file, fmt, args_copy);
+        vfprintf(g_log_file, fmt, args_file);
         fprintf(g_log_file, "\n");
         /*
          * fflush() forces the C runtime to write buffered output to the OS.
@@ -146,7 +167,7 @@ void logger_write(LogLevel level, const char *service, const char *fmt, ...) {
          * want lines to appear immediately — especially on crashes.
          */
         fflush(g_log_file);
-        va_end(args_copy);
+        va_end(args_file);
     }
 
     va_end(args);

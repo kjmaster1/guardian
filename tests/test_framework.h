@@ -126,6 +126,29 @@ static const char *g_current_test = "(no test active)";
     } while (0)
 
 /*
+ * ASSERT_IN_RANGE(val, lo, hi) — verify a numeric value falls within [lo, hi]
+ *
+ * Useful for testing time-based or approximate calculations where an exact
+ * match is impossible (e.g., "this timestamp should be ~1000ms in the future").
+ * Casts everything to long long so it works with int, long, and int64_t.
+ */
+#define ASSERT_IN_RANGE(val, lo, hi)                                             \
+    do {                                                                         \
+        long long _val = (long long)(val);                                       \
+        long long _lo  = (long long)(lo);                                        \
+        long long _hi  = (long long)(hi);                                        \
+        if (_val < _lo || _val > _hi) {                                         \
+            fprintf(stderr, "  FAIL  %s\n", g_current_test);                   \
+            fprintf(stderr, "        Range check failed at %s:%d: "            \
+                            "%lld not in [%lld, %lld]\n",                      \
+                    __FILE__, __LINE__, _val, _lo, _hi);                        \
+            g_tests_failed++;                                                    \
+        } else {                                                                 \
+            printf("  PASS  %s\n", g_current_test);                            \
+        }                                                                        \
+    } while (0)
+
+/*
  * SUMMARY() — print the final pass/fail count
  *
  * Call this at the end of main() in each test file.

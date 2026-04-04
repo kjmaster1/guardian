@@ -3,14 +3,14 @@
 #
 # Usage:
 #   make              Build the guardian binary (default target)
-#   make test         Build and run the test suite
+#   make test         Build and run all test suites
 #   make clean        Remove all build artifacts
 #   make install      Copy binary to /usr/local/bin (Linux/macOS)
 #
 # Platform detection:
 #   Linux  -> uses src/platform/platform_linux.c,  links -lpthread
 #   macOS  -> uses src/platform/platform_macos.c,  links -lpthread
-#   Windows (MSVC) -> uses src/platform/platform_windows.c, links ws2_32.lib
+#   Windows (MinGW) -> uses src/platform/platform_windows.c, links ws2_32
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -56,20 +56,20 @@ ifeq ($(OS),Windows_NT)
     PLATFORM_SRC = src/platform/platform_windows.c
     LDFLAGS     += -lpthread -lws2_32
     TARGET       = guardian.exe
-    TEST_TARGET  = guardian_test.exe
+    TEST_EXT     = .exe
 else
     UNAME := $(shell uname -s)
     ifeq ($(UNAME),Linux)
         PLATFORM_SRC = src/platform/platform_linux.c
         LDFLAGS     += -lpthread
         TARGET       = guardian
-        TEST_TARGET  = guardian_test
+        TEST_EXT     =
     endif
     ifeq ($(UNAME),Darwin)
         PLATFORM_SRC = src/platform/platform_macos.c
         LDFLAGS     += -lpthread
         TARGET       = guardian
-        TEST_TARGET  = guardian_test
+        TEST_EXT     =
     endif
 endif
 
@@ -92,22 +92,37 @@ SRCS = src/main.c        \
        $(PLATFORM_SRC)
 
 # -----------------------------------------------------------------------------
-# Test source files
+# Test binaries
 #
-# Tests are compiled into a SEPARATE binary (guardian_test), not into guardian.
-# This binary runs all unit tests and exits with 0 on success, non-zero on failure.
-# We include the source files under test (config.c, logger.c) so the test
-# binary has access to the functions it's testing.
+# Each test suite is a SEPARATE binary so that:
+#   1. Each has its own main() — no conflicts.
+#   2. Each binary only links what it needs (e.g. test_logger doesn't
+#      need the platform file at all — logger.c uses only standard C).
+#   3. A compilation error in one suite doesn't block the others.
+#
+# Note: we deliberately exclude src/main.c from all test binaries —
+# main() would conflict with the test file's own main().
 # -----------------------------------------------------------------------------
 
-TEST_SRCS = tests/test_config.c  \
-            src/config.c         \
-            src/logger.c         \
-            $(PLATFORM_SRC)
+# Config parser tests: needs config.c, logger.c, and the platform file
+# (config.c → service.h → platform.h, so the platform obj must link).
+TEST_CONFIG  = guardian_test_config$(TEST_EXT)
 
-# Phase 2+ will add:
-#   tests/test_service.c  \
-#   src/service.c         \
+# Service logic tests: service_state_name() + service_compute_backoff_ms()
+# Needs service.c (the code under test), logger.c (used by service.c), platform.
+TEST_SERVICE = guardian_test_service$(TEST_EXT)
+
+# Logger tests: only logger.c — no platform file needed.
+# logger.c uses only standard C (stdio, time, stdarg). This makes it the
+# purest unit test in the suite: zero OS dependencies.
+TEST_LOGGER  = guardian_test_logger$(TEST_EXT)
+
+# Health queue tests: circular buffer push/pop/init from health.c.
+# Needs health.c (the code under test), logger.c, platform.
+TEST_HEALTH  = guardian_test_health$(TEST_EXT)
+
+# All test binaries in one variable for the 'test' target dependency.
+TEST_BINARIES = $(TEST_CONFIG) $(TEST_SERVICE) $(TEST_LOGGER) $(TEST_HEALTH)
 
 # -----------------------------------------------------------------------------
 # Build rules
@@ -131,9 +146,10 @@ version-header:
 
 # How to build the guardian binary:
 #   $@ = the target name (guardian or guardian.exe)
-#   $^ = all prerequisites (SRCS expanded)
 #
 # Depends on version-header so the version string is always current.
+# We use $(SRCS) explicitly instead of $^ to exclude the phony
+# version-header prerequisite from the compiler's input list.
 $(TARGET): version-header $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $@ $(LDFLAGS)
 	@echo ""
@@ -141,23 +157,52 @@ $(TARGET): version-header $(SRCS)
 	@echo "  Run: ./$(TARGET) version"
 	@echo ""
 
-# How to build and run tests:
-#   We compile all TEST_SRCS into guardian_test, then run it immediately.
-#   If any test fails, the binary exits non-zero, and 'make test' fails too.
+# -----------------------------------------------------------------------------
+# Test binary build rules
+# -----------------------------------------------------------------------------
+
+$(TEST_CONFIG): tests/test_config.c src/config.c src/logger.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(TEST_SERVICE): tests/test_service.c src/service.c src/logger.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(TEST_LOGGER): tests/test_logger.c src/logger.c
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(TEST_HEALTH): tests/test_health_queue.c src/health.c src/logger.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# -----------------------------------------------------------------------------
+# Test runner
 #
-#   Note: we deliberately exclude src/main.c from tests — main() would
-#   conflict with the test runner's own main(). Each test file has its own
-#   main() (or a shared one in test_framework.h).
-test: $(TEST_SRCS)
-	$(CC) $(CFLAGS) $(TEST_SRCS) -o $(TEST_TARGET) $(LDFLAGS)
+# Builds all test binaries then runs them in sequence.
+# If any binary exits non-zero (a test failed), make stops immediately
+# and reports failure — standard shell semantics with no '||true' hacks.
+# -----------------------------------------------------------------------------
+
+test: $(TEST_BINARIES)
 	@echo ""
-	./$(TEST_TARGET)
+	@echo "  ── Config parser tests ────────────────────────────────────────"
+	./$(TEST_CONFIG)
+	@echo "  ── Service logic tests ────────────────────────────────────────"
+	./$(TEST_SERVICE)
+	@echo "  ── Logger tests ───────────────────────────────────────────────"
+	./$(TEST_LOGGER)
+	@echo "  ── Health queue tests ─────────────────────────────────────────"
+	./$(TEST_HEALTH)
+	@echo ""
+	@echo "  All test suites passed."
 	@echo ""
 
 # Remove all build artifacts.
 # -f tells rm not to error if the files don't exist.
 clean:
-	rm -f guardian guardian.exe guardian_test guardian_test.exe
+	rm -f guardian guardian.exe
+	rm -f guardian_test_config guardian_test_config.exe
+	rm -f guardian_test_service guardian_test_service.exe
+	rm -f guardian_test_logger  guardian_test_logger.exe
+	rm -f guardian_test_health  guardian_test_health.exe
 	rm -f *.o *.obj *.pdb
 	@echo "  Cleaned."
 
