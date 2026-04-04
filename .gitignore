@@ -38,3 +38,6 @@ compile_commands.json
 # Windows
 Thumbs.db
 desktop.ini
+
+# Claude
+.claude/
