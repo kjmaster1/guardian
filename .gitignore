@@ -11,6 +11,8 @@ guardian_test_logger
 guardian_test_logger.exe
 guardian_test_health
 guardian_test_health.exe
+tests/helper
+tests/helper.exe
 *.o
 *.obj
 *.pdb

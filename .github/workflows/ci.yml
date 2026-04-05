@@ -8,7 +8,7 @@ on:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # Linux build and test
+  # Linux build, unit tests, and integration tests
   # ─────────────────────────────────────────────────────────────────────────
   build-linux:
     name: Build & Test (Linux)
@@ -23,8 +23,11 @@ jobs:
       - name: Build
         run: make
 
-      - name: Run tests
+      - name: Unit tests
         run: make test
+
+      - name: Integration tests
+        run: make integration-test
 
       - name: Smoke test — version
         run: ./guardian version
@@ -37,7 +40,7 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Windows build and test (MinGW via MSYS2)
+  # Windows build, unit tests, and integration tests (MinGW via MSYS2)
   # ─────────────────────────────────────────────────────────────────────────
   build-windows:
     name: Build & Test (Windows)
@@ -58,12 +61,16 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             make
+            mingw-w64-x86_64-python
 
       - name: Build
         run: make
 
-      - name: Run tests
+      - name: Unit tests
         run: make test
+
+      - name: Integration tests
+        run: make integration-test
 
       - name: Smoke test — version
         run: ./guardian.exe version

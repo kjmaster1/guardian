@@ -124,6 +124,12 @@ TEST_HEALTH  = guardian_test_health$(TEST_EXT)
 # All test binaries in one variable for the 'test' target dependency.
 TEST_BINARIES = $(TEST_CONFIG) $(TEST_SERVICE) $(TEST_LOGGER) $(TEST_HEALTH)
 
+# Integration test helper binary.
+# A tiny C program that guardian manages during integration tests:
+#   helper run    — loops forever (long-running service)
+#   helper crash  — exits with code 1 (crashing service)
+HELPER = tests/helper$(TEST_EXT)
+
 # -----------------------------------------------------------------------------
 # Build rules
 # -----------------------------------------------------------------------------
@@ -131,7 +137,7 @@ TEST_BINARIES = $(TEST_CONFIG) $(TEST_SERVICE) $(TEST_LOGGER) $(TEST_HEALTH)
 # .PHONY declares targets that are NOT files on disk.
 # Without this, if you ever create a file named "clean" or "test",
 # make would think the target is up-to-date and refuse to run it.
-.PHONY: all clean test install version-header
+.PHONY: all clean test integration-test install version-header
 
 # 'all' is the default target (first non-special target in the file).
 # Running just 'make' is equivalent to 'make all'.
@@ -203,8 +209,35 @@ clean:
 	rm -f guardian_test_service guardian_test_service.exe
 	rm -f guardian_test_logger  guardian_test_logger.exe
 	rm -f guardian_test_health  guardian_test_health.exe
+	rm -f tests/helper tests/helper.exe
 	rm -f *.o *.obj *.pdb
 	@echo "  Cleaned."
+
+# Build the integration test helper binary.
+# Uses the same CFLAGS as the main build — pedantic warnings are on.
+# helper.c defines _POSIX_C_SOURCE itself so it compiles cleanly on Linux.
+$(HELPER): tests/helper.c
+	$(CC) $(CFLAGS) tests/helper.c -o $(HELPER) $(LDFLAGS)
+
+# Integration tests — run the actual guardian binary against real processes.
+#
+# These tests complement the unit tests: instead of calling individual C
+# functions directly, they observe guardian's external behaviour from the
+# outside (just as a user or another program would).
+#
+# Prerequisites:
+#   - Python 3 in PATH  (python3 or python — we try both)
+#   - The guardian binary must already be built ($(TARGET) dependency)
+#   - The helper binary is built here as a dependency
+#
+# The '-' prefix means: if python3 fails (not found), fall back to python.
+# This handles systems that use 'python' instead of 'python3'.
+integration-test: $(TARGET) $(HELPER)
+	@echo ""
+	@echo "  ── Integration tests ──────────────────────────────────────────"
+	python3 tests/integration_test.py ./$(TARGET) ./$(HELPER) \
+	    || python tests/integration_test.py ./$(TARGET) ./$(HELPER)
+	@echo ""
 
 # Copy the binary to /usr/local/bin so you can run 'guardian' from anywhere.
 # Requires root/sudo on most systems: 'sudo make install'
