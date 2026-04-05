@@ -11,8 +11,6 @@ with exponential backoff, checks their health via TCP/HTTP/command probes, and
 exposes a simple CLI for status and control — all in a single self-contained
 binary with zero runtime dependencies.
 
-![guardian demo](demo.gif)
-
 ---
 
 ## Try it in 60 seconds
