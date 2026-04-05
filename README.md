@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/kjmaster1/guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/kjmaster1/guardian/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/kjmaster1/guardian)
 
 A lightweight, cross-platform process supervisor written in C11.
 
@@ -9,6 +10,31 @@ Guardian monitors long-running processes, restarts them automatically on crash
 with exponential backoff, checks their health via TCP/HTTP/command probes, and
 exposes a simple CLI for status and control — all in a single self-contained
 binary with zero runtime dependencies.
+
+---
+
+## Try it in 60 seconds
+
+```bash
+# Build
+git clone https://github.com/kjmaster1/guardian && cd guardian
+make
+
+# Start the demo (manages two 'sleep' processes)
+./guardian start guardian.ini.demo
+
+# In a second terminal — check live status
+./guardian status guardian.ini.demo
+
+# Kill one managed process and watch guardian restart it
+kill -9 $(pgrep -n sleep)
+./guardian status guardian.ini.demo   # shows BACKOFF → RUNNING
+
+# Stop everything
+./guardian stop guardian.ini.demo
+```
+
+Or click **Open in Codespace** above to try it without installing anything.
 
 ---
 
@@ -243,14 +269,36 @@ See [`docs/architecture.md`](docs/architecture.md) for a deeper walkthrough.
 ## Building and testing
 
 ```bash
-make              # build guardian (or guardian.exe on Windows)
-make test         # run the unit test suite
-make clean        # remove build artifacts
-sudo make install # copy to /usr/local/bin (Linux)
+make                   # build guardian (or guardian.exe on Windows)
+make test              # run the unit test suite
+make integration-test  # run end-to-end tests against the real binary
+make clean             # remove build artifacts
+sudo make install      # copy to /usr/local/bin (Linux)
 ```
 
-The test suite covers the config parser (20 tests) with a zero-dependency
-inline test framework (`tests/test_framework.h`).
+### Test suite
+
+**80 tests** across two levels:
+
+| Suite | Count | What it covers |
+|---|---|---|
+| `tests/test_config.c` | 20 | INI parser: every key, all error paths, edge cases |
+| `tests/test_service.c` | 16 | `service_state_name()` + backoff math (`service_compute_backoff_ms`) |
+| `tests/test_health_queue.c` | 23 | Circular buffer: push/pop, FIFO ordering, overflow protection, wrap-around |
+| `tests/test_logger.c` | 16 | Log format, all level tags, printf args, append semantics |
+| `tests/integration_test.py` | 5 | End-to-end: start, crash→restart, max_retries→FAILED, restart=never, stop |
+
+All unit tests are zero-dependency and run without spawning any processes.
+The integration test suite drives the real `guardian` binary against a
+purpose-built helper process (`tests/helper.c`).
+
+The test suite found a real bug during development: `logger.c` was calling
+`va_copy()` *after* `vfprintf()` had already consumed the `va_list` —
+undefined behaviour that corrupted log file output on Linux while working
+by accident on Windows (MinGW's simpler va_list ABI). The fix: copy before
+the first `vfprintf` call. This is exactly the class of bug that only
+surfaces under a different compiler or platform, and exactly why you write
+cross-platform tests.
 
 Compiler flags: `-std=c11 -Wall -Wextra -Wpedantic -Werror` — no warnings
 are tolerated in the codebase.

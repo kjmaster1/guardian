@@ -1,0 +1,43 @@
+{
+  // GitHub Codespaces / VS Code Dev Container configuration for guardian.
+  //
+  // Anyone can click "Open in Codespace" on the GitHub repo page and get
+  // a fully built, ready-to-run guardian environment in ~30 seconds —
+  // no local toolchain installation required.
+  //
+  // The container is a standard Ubuntu image with gcc, make, and python3
+  // added. The postCreateCommand builds guardian immediately so the binary
+  // is ready as soon as the container starts.
+  "name": "guardian",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+
+  "features": {
+    // Installs gcc, g++, make, cmake, and other common build tools.
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "configureZshAsDefaultShell": false,
+      "installOhMyZsh": false
+    }
+  },
+
+  // Runs once after the container is created.
+  // Installs build dependencies and builds guardian so it's immediately usable.
+  "postCreateCommand": "sudo apt-get update -qq && sudo apt-get install -y gcc make python3 && make && echo '\nguardian built successfully. Try: ./guardian version\n'",
+
+  "customizations": {
+    "vscode": {
+      // C/C++ IntelliSense, code navigation, and debugger support.
+      // Makefile Tools adds syntax highlighting and 'make' task integration.
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        // Point IntelliSense at our source directory.
+        "C_Cpp.default.includePath": ["${workspaceFolder}/src"],
+        "C_Cpp.default.cStandard": "c11",
+        "C_Cpp.default.compilerPath": "/usr/bin/gcc"
+      }
+    }
+  }
+}

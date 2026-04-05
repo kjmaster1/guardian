@@ -1,0 +1,73 @@
+; guardian.ini.demo — 60-second demo config
+;
+; Run this to see guardian in action:
+;
+;   Linux / macOS / WSL:
+;     ./guardian start guardian.ini.demo
+;     ./guardian status guardian.ini.demo   # in another terminal
+;     ./guardian stop guardian.ini.demo
+;
+;   Windows:
+;     guardian.exe start guardian.ini.demo
+;     guardian.exe status guardian.ini.demo
+;     guardian.exe stop guardian.ini.demo
+;
+; To see crash detection and restart in action, kill one of the managed
+; processes and watch guardian restart it:
+;
+;   Linux:    kill -9 $(pgrep -n sleep)
+;   Windows:  taskkill /F /IM ping.exe
+;
+; Then immediately check status — you will see the service in BACKOFF
+; before it restarts to RUNNING.
+
+[supervisor]
+log_file   = /tmp/guardian-demo.log
+ipc_socket = /tmp/guardian-demo.sock
+
+; ─────────────────────────────────────────────────────────────────
+; counter — a lightweight long-running service
+;
+; Uses 'sleep' on Linux (built-in) or 'ping' on Windows.
+; Demonstrates: autostart, on_failure restart, exponential backoff.
+; ─────────────────────────────────────────────────────────────────
+
+[counter]
+; Linux / macOS / WSL — sleep loops forever:
+command     = sleep
+args        = 999999
+; Windows — uncomment these two lines and comment out the two above:
+; command   = C:\Windows\System32\ping.exe
+; args      = -t 127.0.0.1
+
+autostart       = true
+restart         = on_failure
+max_retries     = 0
+backoff_base_ms = 1000
+backoff_max_ms  = 30000
+stdout_log      = /tmp/guardian-demo-counter.log
+
+; ─────────────────────────────────────────────────────────────────
+; worker — a second service to show multi-service supervision
+; ─────────────────────────────────────────────────────────────────
+
+[worker]
+command     = sleep
+args        = 999999
+; Windows:
+; command   = C:\Windows\System32\ping.exe
+; args      = -t 127.0.0.1
+
+autostart       = true
+restart         = always
+max_retries     = 0
+backoff_base_ms = 2000
+backoff_max_ms  = 60000
+stdout_log      = /tmp/guardian-demo-worker.log
+
+[health_check]
+type                = tcp
+target              = 127.0.0.1:65001
+interval_s          = 10
+timeout_s           = 2
+unhealthy_threshold = 3
