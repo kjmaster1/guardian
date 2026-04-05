@@ -49,5 +49,8 @@ compile_commands.json
 Thumbs.db
 desktop.ini
 
+# Demo recording (raw cast file — GIF is committed instead)
+demo.cast
+
 # Claude
 .claude/
