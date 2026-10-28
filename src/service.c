@@ -102,9 +102,13 @@ int service_schedule_restart(Service *svc) {
     /*
      * Go to BACKOFF. The event loop will check next_restart_ms each tick
      * and call service_start() when the delay has elapsed.
+     *
+     * retry_count was just incremented, so attempt n uses exponent n - 1:
+     * the first restart waits backoff_base_ms, matching the docs' table
+     * (1s, 2s, 4s, ...). Passing retry_count itself doubled every delay.
      */
     svc->rt.next_restart_ms = service_compute_backoff_ms(&svc->cfg,
-                                                          svc->rt.retry_count);
+                                                          svc->rt.retry_count - 1);
     svc->rt.state = STATE_BACKOFF;
 
     int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();

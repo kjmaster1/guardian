@@ -280,8 +280,8 @@ stdout_log      = {log}
         #   t~100ms   supervisor tick: process still alive → RUNNING
         #                              (or already dead → crash handling)
         #   t~200ms   process exits (code 1) → retry_count=1, BACKOFF
-        #             next_restart = now + 300*2 = 600ms from crash
-        #   t~800ms   BACKOFF delay expires → restart attempt
+        #             next_restart = now + 300ms (first delay = base)
+        #   t~500ms   BACKOFF delay expires → restart attempt
         #   ...        (loops forever because max_retries=0)
         #
         # We expect to see BACKOFF at some point within 4 seconds.
@@ -305,11 +305,11 @@ def test_max_retries_leads_to_failed(guardian, helper):
     transition permanently to FAILED.
 
     With max_retries=2 and base=200ms:
-      Crash 1 → BACKOFF(400ms) → restart
-      Crash 2 → BACKOFF(800ms) → restart
+      Crash 1 → BACKOFF(200ms) → restart
+      Crash 2 → BACKOFF(400ms) → restart
       Crash 3 → FAILED (retry_count 3 > max_retries 2)
 
-    Total expected time to FAILED: ~1.2 seconds. We allow 6 seconds.
+    Total expected time to FAILED: ~0.6 seconds. We allow 6 seconds.
 
     This validates the give-up logic in handle_exited_service().
     """

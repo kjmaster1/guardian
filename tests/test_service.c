@@ -236,6 +236,29 @@ static void test_schedule_restart_enters_backoff(void) {
     ASSERT(svc.rt.next_restart_ms > before);
 }
 
+/*
+ * Regression: retry_count is incremented before the delay is computed, so
+ * the first restart used to wait base * 2^1 — double the documented
+ * "initial restart delay" (docs/config_reference.md backoff table).
+ */
+static void test_schedule_restart_first_delay_is_base(void) {
+    TEST("first scheduled restart waits exactly backoff_base_ms");
+    Service svc = make_svc(5);
+
+    int64_t before = platform_now_ms();
+    service_schedule_restart(&svc);
+    int64_t after  = platform_now_ms();
+
+    ASSERT_IN_RANGE(svc.rt.next_restart_ms, before + 1000, after + 1000);
+
+    TEST("second scheduled restart waits 2 * backoff_base_ms");
+    before = platform_now_ms();
+    service_schedule_restart(&svc);
+    after  = platform_now_ms();
+
+    ASSERT_IN_RANGE(svc.rt.next_restart_ms, before + 2000, after + 2000);
+}
+
 static void test_schedule_restart_gives_up_after_max(void) {
     TEST("schedule_restart past max_retries enters FAILED");
     Service svc = make_svc(2);
@@ -288,6 +311,7 @@ int main(void) {
 
     /* service_schedule_restart */
     test_schedule_restart_enters_backoff();
+    test_schedule_restart_first_delay_is_base();
     test_schedule_restart_gives_up_after_max();
     test_schedule_restart_unlimited();
     SUMMARY();
