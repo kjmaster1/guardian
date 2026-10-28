@@ -30,8 +30,8 @@
 #include "platform.h"
 
 #include <stdio.h>       /* fprintf, snprintf */
-#include <string.h>      /* memset, strncpy, strtok, strchr */
-#include <stdlib.h>      /* NULL, _exit, atoi, setenv */
+#include <string.h>      /* memset, strncpy, strchr, strncmp */
+#include <stdlib.h>      /* NULL, malloc, free */
 #include <errno.h>       /* errno, EAGAIN, EWOULDBLOCK, EINTR, ENOENT */
 
 /* Process management */
@@ -167,12 +167,21 @@ void platform_install_signal_handlers(atomic_int *shutdown_flag) {
  * ==========================================================================
  */
 
+/* The process environment. POSIX requires programs to declare it themselves. */
+extern char **environ;
+
 /*
  * parse_args_into — split an args string into an argv array
  *
- * Splits 'args_str' on spaces and fills argv[] starting at argv[start_idx].
- * argv[0..start_idx-1] must already be set by the caller (typically argv[0]
- * = command path). Returns the total argc (not counting the trailing NULL).
+ * Splits 'args_copy' in place on spaces and fills argv[] starting at
+ * argv[start_idx]. argv[0..start_idx-1] must already be set by the caller
+ * (typically argv[0] = command path). Returns the total argc (not counting
+ * the trailing NULL).
+ *
+ * Why not strtok()? strtok remembers its position in hidden static state,
+ * so two threads tokenizing at once corrupt each other — and health threads
+ * call platform_spawn() for 'command' probes. This loop keeps its state in
+ * a local pointer instead.
  *
  * Limitation: doesn't handle quoted arguments with internal spaces.
  * For the use cases guardian targets (simple daemons), this is sufficient.
@@ -180,18 +189,97 @@ void platform_install_signal_handlers(atomic_int *shutdown_flag) {
 static int parse_args_into(char *args_copy, const char **argv,
                             int start_idx, int max_args) {
     int argc = start_idx;
-    if (args_copy[0] == '\0') {
-        argv[argc] = NULL;
-        return argc;
-    }
+    char *p = args_copy;
 
-    char *token = strtok(args_copy, " ");
-    while (token && argc < max_args - 1) {
-        argv[argc++] = token;
-        token = strtok(NULL, " ");
+    while (*p && argc < max_args - 1) {
+        while (*p == ' ') p++;          /* skip separators */
+        if (*p == '\0') break;
+        argv[argc++] = p;               /* token starts here */
+        while (*p && *p != ' ') p++;    /* find its end */
+        if (*p) *p++ = '\0';            /* terminate it and move on */
     }
     argv[argc] = NULL;
     return argc;
+}
+
+/* Does environment entry "NAME=..." define the same NAME as "NAME=VALUE"?
+ * (Linux variable names are case-sensitive.) */
+static int same_env_name(const char *a, const char *b) {
+    while (*a && *a != '=' && *a == *b) { a++; b++; }
+    return *a == '=' && *b == '=';
+}
+
+/*
+ * build_envp — guardian's environment with the service's env vars applied
+ *
+ * An override replaces an inherited variable of the same name; new names
+ * are appended. Returns a malloc'd NULL-terminated array. Only the array is
+ * owned by the caller: the strings themselves still belong to environ and
+ * env_vars, which outlive the exec. NULL on allocation failure.
+ */
+static char **build_envp(const char **env_vars, int env_count) {
+    int inherited = 0;
+    while (environ && environ[inherited]) inherited++;
+
+    char **envp = malloc((size_t)(inherited + env_count + 1) * sizeof(char *));
+    if (envp == NULL) return NULL;
+
+    int count = 0;
+    for (int i = 0; i < inherited; i++) envp[count++] = environ[i];
+
+    for (int i = 0; i < env_count; i++) {
+        if (strchr(env_vars[i], '=') == NULL) continue;  /* not KEY=VALUE */
+        int j = 0;
+        while (j < count && !same_env_name(envp[j], env_vars[i])) j++;
+        envp[j] = (char *)env_vars[i];   /* replace, or append when j == count */
+        if (j == count) count++;
+    }
+    envp[count] = NULL;
+    return envp;
+}
+
+/*
+ * resolve_command — find the executable the way execvp() would
+ *
+ * A command containing '/' is used as-is (a relative one resolves against
+ * working_dir, because the child chdirs before exec). Otherwise each PATH
+ * directory is tried in order; an empty entry means the current directory.
+ * PATH comes from envp, so a service's own 'env = PATH=...' is honoured,
+ * just as execvp() in the child used to honour it.
+ *
+ * Returns 1 and fills 'out' on success, 0 if nothing executable was found.
+ */
+static int resolve_command(const char *command, char *const *envp,
+                           char *out, size_t out_size) {
+    if (strchr(command, '/') != NULL) {
+        int n = snprintf(out, out_size, "%s", command);
+        return n > 0 && (size_t)n < out_size;
+    }
+
+    const char *path = "/bin:/usr/bin";  /* glibc's default when PATH is unset */
+    for (char *const *e = envp; *e; e++) {
+        if (strncmp(*e, "PATH=", 5) == 0) { path = *e + 5; break; }
+    }
+
+    for (;;) {
+        const char *colon = strchr(path, ':');
+        int dir_len = colon ? (int)(colon - path) : (int)strlen(path);
+        int n = dir_len == 0
+              ? snprintf(out, out_size, "%s", command)
+              : snprintf(out, out_size, "%.*s/%s", dir_len, path, command);
+        if (n > 0 && (size_t)n < out_size && access(out, X_OK) == 0) return 1;
+        if (colon == NULL) return 0;
+        path = colon + 1;
+    }
+}
+
+/* Report a setup failure from the child and exit. Only async-signal-safe
+ * calls: write(), strlen() and _exit(). _exit (not exit) skips stdio
+ * flushing and atexit handlers, which belong to the parent. */
+static _Noreturn void child_fail(const char *msg) {
+    ssize_t ignored = write(STDERR_FILENO, msg, strlen(msg));
+    (void)ignored;
+    _exit(1);
 }
 
 SpawnResult platform_spawn(const char  *command,
@@ -206,12 +294,25 @@ SpawnResult platform_spawn(const char  *command,
     result.handle = PLATFORM_INVALID_HANDLE;  /* unused on POSIX */
 
     /*
-     * Build argv before fork. strtok modifies the string in-place,
-     * so we copy args into a local buffer first.
+     * WHY SO MUCH HAPPENS BEFORE fork()
      *
-     * argv layout:  [ command, arg1, arg2, ..., NULL ]
-     * argv[0] is the program name (convention: use the command path).
+     * guardian is multithreaded (one health thread per checked service).
+     * fork() copies only the CALLING thread into the child. If another
+     * thread held a lock at that instant — say, inside malloc() or
+     * setenv() — the child inherits that lock still locked, with no thread
+     * left to ever unlock it. The first time the child needs that lock it
+     * deadlocks: the service just hangs, never exec'd.
+     *
+     * POSIX's rule: in the child of a multithreaded process, call only
+     * async-signal-safe functions until exec. The old code called setenv()
+     * (which locks and mallocs) and execvp() (not on the safe list) there.
+     *
+     * So the parent does all the unsafe work up front — splitting args,
+     * building the environment, searching PATH — and the child only runs
+     * chdir/open/dup2/close/execve, which are all on the safe list.
      */
+
+    /* argv layout: [ command, arg1, arg2, ..., NULL ] */
     char args_copy[256];
     strncpy(args_copy, args ? args : "", sizeof(args_copy) - 1);
     args_copy[sizeof(args_copy) - 1] = '\0';
@@ -219,6 +320,24 @@ SpawnResult platform_spawn(const char  *command,
     const char *argv[64];
     argv[0] = command;
     parse_args_into(args_copy, argv, 1, 64);
+
+    char **envp = build_envp(env_vars, env_vars ? env_count : 0);
+    if (envp == NULL) {
+        snprintf(result.error_msg, sizeof(result.error_msg),
+                 "out of memory building environment");
+        return result;
+    }
+
+    /* Resolved here rather than by execvp() in the child. Bonus: a missing
+     * command is now reported as a spawn failure in guardian's log instead
+     * of a child that mysteriously exits with code 1. */
+    char exe_path[4096];
+    if (!resolve_command(command, envp, exe_path, sizeof(exe_path))) {
+        snprintf(result.error_msg, sizeof(result.error_msg),
+                 "'%s' not found in PATH", command);
+        free(envp);
+        return result;
+    }
 
     /* ----------------------------------------------------------------
      * fork() — THE KEY CALL
@@ -235,53 +354,25 @@ SpawnResult platform_spawn(const char  *command,
     if (pid < 0) {
         snprintf(result.error_msg, sizeof(result.error_msg),
                  "fork() failed: %s", strerror(errno));
+        free(envp);
         return result;
     }
 
     if (pid == 0) {
         /* ================================================================
-         * CHILD PROCESS — this code runs in the newly forked process
-         *
-         * Goal: set up the environment, then replace ourselves with the
-         * target program via execvp(). If exec succeeds, this code
-         * never continues past the execvp() call.
-         *
-         * IMPORTANT: after fork(), we must be careful what we call.
-         * Async-signal-safe rules don't apply here (we're not in a signal
-         * handler), but we should avoid functions that might interact
-         * badly with the parent's state: no printf (may flush buffers),
-         * no malloc (heap may be mid-operation). We use _exit() not exit()
-         * so we don't flush stdio or run atexit() handlers.
+         * CHILD PROCESS — async-signal-safe calls only from here to exec.
+         * Everything it needs (argv, envp, exe_path) was prepared by the
+         * parent; fork() gave the child its own copy of that memory.
          * ================================================================ */
 
         /* 1. Change working directory if configured */
         if (working_dir && working_dir[0] != '\0') {
             if (chdir(working_dir) != 0) {
-                /* Write directly to stderr — can't use fprintf after fork */
-                const char *msg = "guardian: chdir failed\n";
-                write(STDERR_FILENO, msg, strlen(msg));
-                _exit(1);
+                child_fail("guardian: chdir failed\n");
             }
         }
 
-        /* 2. Add environment variables */
-        for (int i = 0; i < env_count; i++) {
-            /*
-             * setenv() parses "KEY=VALUE" — we need to split it.
-             * We find the '=' and temporarily null it to extract the key,
-             * then restore it. A cleaner alternative is putenv(), but that
-             * doesn't copy the string. setenv() copies, which is safer.
-             */
-            char env_copy[256];
-            strncpy(env_copy, env_vars[i], sizeof(env_copy) - 1);
-            char *eq = strchr(env_copy, '=');
-            if (eq) {
-                *eq = '\0';
-                setenv(env_copy, eq + 1, 1 /* overwrite */);
-            }
-        }
-
-        /* 3. Redirect stdout to log file (if configured)
+        /* 2. Redirect stdout to log file (if configured)
          *
          * dup2(old_fd, new_fd) makes new_fd an alias for old_fd.
          * After dup2(file_fd, STDOUT_FILENO), anything the child writes
@@ -298,7 +389,7 @@ SpawnResult platform_spawn(const char  *command,
             }
         }
 
-        /* 4. Redirect stderr to log file (if configured) */
+        /* 3. Redirect stderr to log file (if configured) */
         if (stderr_log && stderr_log[0] != '\0') {
             int fd = open(stderr_log,
                           O_WRONLY | O_CREAT | O_APPEND,
@@ -309,26 +400,25 @@ SpawnResult platform_spawn(const char  *command,
             }
         }
 
-        /* 5. exec — replace this process image with the target program
+        /* 4. exec — replace this process image with the target program
          *
-         * execvp() searches PATH for the command (like a shell does).
-         * argv must end with a NULL sentinel.
+         * execve() takes the already-resolved path and the environment
+         * we built, so it needs no PATH search and no setenv(). argv and
+         * envp must end with a NULL sentinel.
          *
-         * If execvp() RETURNS, it failed. Normal exec doesn't return.
+         * If execve() RETURNS, it failed. Normal exec doesn't return.
          */
-        execvp(command, (char *const *)argv);
-
-        /* If we reach here, exec failed */
-        const char *msg = "guardian: execvp failed\n";
-        write(STDERR_FILENO, msg, strlen(msg));
-        _exit(1);
+        execve(exe_path, (char *const *)argv, envp);
+        child_fail("guardian: exec failed\n");
     }
 
     /* ====================================================================
      * PARENT PROCESS — continues here after fork()
      *
-     * The child is now running independently. We store its PID and return.
+     * The child is now running independently. It has its own copy of envp,
+     * so the parent's array can be freed. We store its PID and return.
      * ==================================================================== */
+    free(envp);
     result.success = 1;
     result.pid     = pid;
     return result;

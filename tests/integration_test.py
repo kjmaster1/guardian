@@ -605,6 +605,82 @@ stdout_log = {log}
         if proc:
             stop_guardian(guardian, cfg, proc)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_command_found_via_service_path(guardian, helper):
+    """
+    A bare command name is looked up in PATH, and a service's own
+    'env = PATH=...' takes part in that lookup.
+
+    guardian used to call execvp() in the child after setenv(), which gave
+    this behaviour for free. The PATH search now happens in the parent
+    (so the child only makes fork-safe calls); this test pins the behaviour.
+    Linux only: on Windows, CreateProcess searches guardian's own PATH.
+    """
+    if IS_WINDOWS:
+        return
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t9")
+        cfg  = write_config(tmpdir, "t9.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[path-svc]
+command = {os.path.basename(helper)}
+args    = run
+env     = PATH={os.path.dirname(helper)}
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("bare command name is resolved through the service's PATH")
+        ASSERT(
+            wait_for_state(guardian, cfg, "path-svc", "RUNNING", timeout_s=5),
+            "service did not start — PATH lookup failed",
+        )
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_missing_command_reaches_failed(guardian, helper):
+    """
+    A command that cannot be launched at all must give up after max_retries.
+
+    Regression: a failed launch scheduled its own restart without checking
+    max_retries, so on Windows (where CreateProcess fails up front) the
+    service retried forever and never reached FAILED.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t10")
+        cfg  = write_config(tmpdir, "t10.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[missing-svc]
+command         = guardian-no-such-command
+max_retries     = 1
+backoff_base_ms = 100
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("service whose command does not exist reaches FAILED")
+        ASSERT(
+            wait_for_state(guardian, cfg, "missing-svc", "FAILED", timeout_s=6),
+            "FAILED never appeared — spawn failures may be ignoring max_retries",
+        )
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
@@ -643,6 +719,8 @@ def main():
     test_unhealthy_hung_service_is_restarted(guardian, helper)
     test_second_instance_is_refused(guardian, helper)
     test_env_vars_reach_child(guardian, helper)
+    test_command_found_via_service_path(guardian, helper)
+    test_missing_command_reaches_failed(guardian, helper)
 
     ok = SUMMARY()
     sys.exit(0 if ok else 1)
