@@ -846,10 +846,23 @@ int platform_ipc_recv(int fd, char *buf, int len) {
     if (h == INVALID_HANDLE_VALUE) return -1;
 
     if (g_ipc_is_server[fd]) {
-        /* Non-blocking path: check without committing to a read */
+        /*
+         * Non-blocking path: check without committing to a read.
+         *
+         * The client connects first and writes its command a moment later,
+         * and we accept on a 100ms tick — so we can arrive between the two.
+         * Hanging up then made 'guardian status' fail at random. Wait up to
+         * 1s for the command (the Linux side gets the same effect from a
+         * blocking recv with SO_RCVTIMEO). PeekNamedPipe fails as soon as
+         * the client disconnects, so a client that leaves costs nothing.
+         */
         DWORD available = 0;
-        if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL)) return -1;
-        if (available == 0) return 0;  /* nothing to read yet */
+        for (int waited_ms = 0; ; waited_ms += 10) {
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL)) return -1;
+            if (available > 0) break;
+            if (waited_ms >= 1000) return 0;  /* client never sent anything */
+            Sleep(10);
+        }
     }
     /* else: client fd in blocking mode — fall straight through to ReadFile */
 
