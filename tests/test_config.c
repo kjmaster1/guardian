@@ -394,6 +394,49 @@ static void test_default_values_applied(void) {
                   (int)ctx.services[0].cfg.restart_policy);
 }
 
+
+/*
+ * Regression: a [health_check] that omits interval_s / timeout_s /
+ * unhealthy_threshold used to leave them at 0. interval_s = 0 made the
+ * health thread probe in a tight loop (thousands of probes per second).
+ */
+static void test_health_check_defaults_applied(void) {
+    TEST("health check gets documented defaults (10s / 3s / 3) when keys are absent");
+
+    const char *ini =
+        "[api]\n"
+        "command = /bin/api\n"
+        "[health_check]\n"
+        "type   = tcp\n"
+        "target = 127.0.0.1:8080\n";
+
+    char *path = write_temp_config(ini);
+    SupervisorContext ctx;
+    ConfigError err = config_load(path, &ctx);
+    remove(path);
+
+    ASSERT_INT_EQ(CONFIG_OK, (int)err);
+    ASSERT_INT_EQ(10, ctx.services[0].cfg.health.interval_s);
+    ASSERT_INT_EQ(3,  ctx.services[0].cfg.health.timeout_s);
+    ASSERT_INT_EQ(3,  ctx.services[0].cfg.health.unhealthy_threshold);
+}
+
+static void test_health_check_without_target_is_error(void) {
+    TEST("[health_check] without a target is a syntax error");
+
+    const char *ini =
+        "[api]\n"
+        "command = /bin/api\n"
+        "[health_check]\n"
+        "type = tcp\n";
+
+    char *path = write_temp_config(ini);
+    SupervisorContext ctx;
+    ConfigError err = config_load(path, &ctx);
+    remove(path);
+
+    ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)err);
+}
 /* ==========================================================================
  * Test runner
  * ==========================================================================
@@ -420,6 +463,8 @@ int main(void) {
     test_unknown_keys_ignored();
     test_autostart_values();
     test_default_values_applied();
+    test_health_check_defaults_applied();
+    test_health_check_without_target_is_error();
 
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;

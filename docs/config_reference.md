@@ -90,7 +90,7 @@ to that service. Each service may have at most one health check.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `type` | enum | — | `tcp`, `http`, or `command` |
-| `target` | string | — | What to probe (format depends on type) |
+| `target` | string | — | What to probe (format depends on type). Required |
 | `interval_s` | int (s) | `10` | Seconds between probes |
 | `timeout_s` | int (s) | `3` | Seconds before a probe is considered failed |
 | `unhealthy_threshold` | int | `3` | Consecutive failures before triggering a restart |

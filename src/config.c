@@ -244,7 +244,17 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                     return CONFIG_ERR_SYNTAX;
                 }
                 current_section = SECTION_HEALTH_CHECK;
-                ctx->services[current_svc_idx].cfg.has_health_check = 1;
+
+                /* Documented defaults (docs/config_reference.md). Without
+                 * these, an omitted interval_s stays 0 and the health thread
+                 * probes in a tight loop with no sleep at all. */
+                ServiceConfig *hc_owner = &ctx->services[current_svc_idx].cfg;
+                if (!hc_owner->has_health_check) {
+                    hc_owner->has_health_check           = 1;
+                    hc_owner->health.interval_s          = 10;
+                    hc_owner->health.timeout_s           = 3;
+                    hc_owner->health.unhealthy_threshold = 3;
+                }
 
             } else {
                 /* Any other [name] is a new service section */
@@ -474,6 +484,14 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
             LOG_ERROR("guardian", "Service '%s' has no 'command' key — required",
                       ctx->services[i].cfg.name);
             return CONFIG_ERR_NO_COMMAND;
+        }
+
+        const ServiceConfig *cfg = &ctx->services[i].cfg;
+        if (cfg->has_health_check && cfg->health.type != HEALTH_NONE &&
+            cfg->health.target[0] == '\0') {
+            LOG_ERROR("guardian", "Service '%s': [health_check] has no 'target'",
+                      cfg->name);
+            return CONFIG_ERR_SYNTAX;
         }
     }
 
