@@ -254,16 +254,19 @@ static int cmd_start(int argc, char *argv[]) {
     LOG_INFO("guardian", "Loading configuration from '%s'", config_path);
 
     /*
-     * Declare the SupervisorContext on the stack.
+     * 'static' gives ctx static storage (like a global, but only visible
+     * here) instead of putting it on the stack.
      *
-     * Stack allocation: the variable lives in the current function's
-     * stack frame. It is automatically freed when the function returns.
-     * No malloc(), no free(). For a struct this size (~50KB with 64 services),
-     * this is perfectly safe — the default stack size is typically 1-8MB.
+     * Why not the stack? SupervisorContext is ~727KB — 64 services, each
+     * with ~11KB of fixed-size strings. Measured with gcc -fstack-usage,
+     * cli_run() plus cmd_start() needed ~1.47MB of stack before the
+     * supervisor even started. Windows gives the main thread 1MB (MSVC) or
+     * 2MB (MinGW) by default, so this was one more feature away from a
+     * stack overflow at startup. Linux's 8MB default hid the problem.
      *
      * The config_load() function takes a pointer to ctx and fills it in.
      */
-    SupervisorContext ctx;
+    static SupervisorContext ctx;
     ConfigError err = config_load(config_path, &ctx);
 
     if (err != CONFIG_OK) {
@@ -374,8 +377,9 @@ static int cmd_logs(int argc, char *argv[]) {
     const char *service_name = argv[2];
     const char *config_path  = argv[3];
 
-    /* Load config to find the service's log file path */
-    SupervisorContext ctx;
+    /* Load config to find the service's log file path.
+     * static: too big for the stack — see cmd_start. */
+    static SupervisorContext ctx;
     if (config_load(config_path, &ctx) != CONFIG_OK) {
         fprintf(stderr, "guardian: failed to load config '%s'\n", config_path);
         return EXIT_FAILURE;
@@ -510,9 +514,10 @@ int cli_run(int argc, char *argv[]) {
     }
 
     if (strcmp(command, "stop") == 0) {
-        /* Read config to find the ipc_socket path, or use the default */
+        /* Read config to find the ipc_socket path, or use the default.
+         * static: too big for the stack — see cmd_start. */
         const char *path = DEFAULT_IPC_PATH;
-        SupervisorContext ctx;
+        static SupervisorContext ctx;
         if (argc >= 3 && config_load(argv[2], &ctx) == CONFIG_OK
                       && ctx.ipc_socket[0] != '\0') {
             path = ctx.ipc_socket;
@@ -527,12 +532,12 @@ int cli_run(int argc, char *argv[]) {
 
     if (strcmp(command, "status") == 0) {
         const char *path = DEFAULT_IPC_PATH;
-        SupervisorContext ctx;
+        static SupervisorContext ctx;
         if (argc >= 3 && config_load(argv[2], &ctx) == CONFIG_OK
                       && ctx.ipc_socket[0] != '\0') {
             path = ctx.ipc_socket;
         }
-        char resp[IPC_MSG_MAX];
+        static char resp[IPC_MSG_MAX];
         if (!ipc_send_command(path, "{\"cmd\":\"status\"}", resp, sizeof(resp))) {
             return EXIT_FAILURE;
         }
