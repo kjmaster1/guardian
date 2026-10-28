@@ -664,8 +664,11 @@ int platform_ipc_accept(int server_fd) {
         return -1;
     }
 
+
     if (err == ERROR_NO_DATA) {
-        /* No client yet — alternate response on newer Windows with PIPE_NOWAIT */
+        /* A client connected and hung up before we checked, so the line is
+           stuck half-closed. Hang up our end so the next client can connect. */
+        DisconnectNamedPipe(h);
         return -1;
     }
 
