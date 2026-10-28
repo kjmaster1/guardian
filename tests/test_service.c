@@ -271,6 +271,69 @@ static void test_schedule_restart_gives_up_after_max(void) {
     ASSERT_INT_EQ((int)STATE_FAILED, (int)svc.rt.state);
 }
 
+/* ==========================================================================
+ * service_reset_retries_if_stable() tests
+ *
+ * retry_count is the restart *budget* that max_retries limits. Without a
+ * reset it only ever grew, so a service that crashed once a day reached
+ * FAILED after max_retries days. Once a service has stayed up for
+ * stable_after_s, its earlier crashes are forgiven.
+ * ==========================================================================
+ */
+
+/* A service that (re)started 'up_for_ms' ago after 3 restarts. */
+static Service make_running_svc(int stable_after_s, int64_t up_for_ms,
+                                int64_t *now_out) {
+    Service svc = make_svc(5);
+    svc.cfg.stable_after_s = stable_after_s;
+    svc.rt.state           = STATE_RUNNING;
+    svc.rt.retry_count     = 3;
+    svc.rt.total_restarts  = 3;
+    *now_out               = platform_now_ms();
+    svc.rt.started_at_ms   = *now_out - up_for_ms;
+    return svc;
+}
+
+static void test_retries_reset_after_stable_uptime(void) {
+    TEST("retry budget resets once RUNNING for stable_after_s");
+    int64_t now;
+    Service svc = make_running_svc(60, 60000, &now);
+
+    ASSERT_INT_EQ(1, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(0, svc.rt.retry_count);
+
+    TEST("lifetime restart count survives the reset");
+    ASSERT_INT_EQ(3, svc.rt.total_restarts);
+}
+
+static void test_retries_kept_before_stable_uptime(void) {
+    TEST("retry budget is kept while uptime < stable_after_s");
+    int64_t now;
+    Service svc = make_running_svc(60, 59000, &now);
+
+    ASSERT_INT_EQ(0, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(3, svc.rt.retry_count);
+}
+
+static void test_retries_never_reset_when_disabled(void) {
+    TEST("stable_after_s = 0 disables the reset");
+    int64_t now;
+    Service svc = make_running_svc(0, 3600000, &now);
+
+    ASSERT_INT_EQ(0, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(3, svc.rt.retry_count);
+}
+
+static void test_retries_not_reset_unless_running(void) {
+    TEST("retry budget is not reset for a service in BACKOFF");
+    int64_t now;
+    Service svc = make_running_svc(60, 3600000, &now);
+    svc.rt.state = STATE_BACKOFF;
+
+    ASSERT_INT_EQ(0, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(3, svc.rt.retry_count);
+}
+
 static void test_schedule_restart_unlimited(void) {
     TEST("schedule_restart with max_retries = 0 never gives up");
     Service svc = make_svc(0);
@@ -314,6 +377,13 @@ int main(void) {
     test_schedule_restart_first_delay_is_base();
     test_schedule_restart_gives_up_after_max();
     test_schedule_restart_unlimited();
+
+    /* service_reset_retries_if_stable */
+    test_retries_reset_after_stable_uptime();
+    test_retries_kept_before_stable_uptime();
+    test_retries_never_reset_when_disabled();
+    test_retries_not_reset_unless_running();
+
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -100,7 +100,7 @@ static void build_status_response(const SupervisorContext *ctx,
             svc->cfg.name,
             service_state_name(svc->rt.state),
             pid,
-            svc->rt.retry_count,
+            svc->rt.total_restarts,  /* lifetime, not the resettable budget */
             (long long)uptime_s
         );
 

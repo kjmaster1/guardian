@@ -327,6 +327,7 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                 ctx->services[current_svc_idx].cfg.max_retries      = 5;
                 ctx->services[current_svc_idx].cfg.backoff_base_ms  = 1000;
                 ctx->services[current_svc_idx].cfg.backoff_max_ms   = 60000;
+                ctx->services[current_svc_idx].cfg.stable_after_s   = 60;
                 ctx->services[current_svc_idx].cfg.autostart        = 1;
             }
             continue;
@@ -437,6 +438,14 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                 if (!parse_int(value, &cfg->backoff_max_ms) || cfg->backoff_max_ms <= 0) {
                     LOG_ERROR("guardian",
                               "Config line %d: invalid backoff_max_ms '%s'",
+                              line_number, value);
+                    fclose(f);
+                    return CONFIG_ERR_SYNTAX;
+                }
+            } else if (strcmp(key, "stable_after_s") == 0) {
+                if (!parse_int(value, &cfg->stable_after_s) || cfg->stable_after_s < 0) {
+                    LOG_ERROR("guardian",
+                              "Config line %d: invalid stable_after_s '%s'",
                               line_number, value);
                     fclose(f);
                     return CONFIG_ERR_SYNTAX;

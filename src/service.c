@@ -89,6 +89,7 @@ int64_t service_compute_backoff_ms(const ServiceConfig *cfg, int retry_count) {
 int service_schedule_restart(Service *svc) {
     /* max_retries == 0 means unlimited — we never give up. */
     svc->rt.retry_count++;
+    svc->rt.total_restarts++;
 
     if (svc->cfg.max_retries > 0 &&
         svc->rt.retry_count > svc->cfg.max_retries) {
@@ -117,6 +118,33 @@ int service_schedule_restart(Service *svc) {
              (double)delay_ms / 1000.0,
              svc->rt.retry_count,
              svc->cfg.max_retries > 0 ? "" : ", unlimited retries");
+    return 1;
+}
+
+/* ==========================================================================
+ * service_reset_retries_if_stable
+ *
+ * Without this, retry_count only ever grew. max_retries = 5 then meant
+ * "five crashes in the service's whole lifetime", so a service that crashed
+ * once a day ended up FAILED after five days of otherwise healthy running.
+ * What max_retries is really meant to catch is a crash LOOP — a service
+ * that dies again soon after every restart. A long stable run proves the
+ * loop is over, so the budget (and the backoff delay) starts fresh.
+ * ==========================================================================
+ */
+
+int service_reset_retries_if_stable(Service *svc, int64_t now_ms) {
+    if (svc->rt.state != STATE_RUNNING) return 0;
+    if (svc->rt.retry_count == 0)       return 0;  /* nothing to forgive */
+    if (svc->cfg.stable_after_s <= 0)   return 0;  /* reset disabled */
+
+    int64_t up_ms = now_ms - svc->rt.started_at_ms;
+    if (up_ms < (int64_t)svc->cfg.stable_after_s * 1000) return 0;
+
+    LOG_INFO(svc->cfg.name,
+             "Stable for %ds — restart budget reset (had used %d)",
+             svc->cfg.stable_after_s, svc->rt.retry_count);
+    svc->rt.retry_count = 0;
     return 1;
 }
 

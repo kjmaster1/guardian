@@ -390,10 +390,28 @@ static void test_default_values_applied(void) {
     ASSERT_INT_EQ(5,    ctx.services[0].cfg.max_retries);
     ASSERT_INT_EQ(1000, ctx.services[0].cfg.backoff_base_ms);
     ASSERT_INT_EQ(60000,ctx.services[0].cfg.backoff_max_ms);
+    ASSERT_INT_EQ(60,   ctx.services[0].cfg.stable_after_s);
     ASSERT_INT_EQ((int)RESTART_ON_FAILURE,
                   (int)ctx.services[0].cfg.restart_policy);
 }
 
+static void test_stable_after_s_parsed(void) {
+    TEST("stable_after_s accepts 0 (never reset) and positive values");
+
+    char *p; SupervisorContext ctx;
+
+    p = write_temp_config("[s]\ncommand = /bin/x\nstable_after_s = 0\n");
+    ASSERT_INT_EQ(CONFIG_OK, (int)config_load(p, &ctx)); remove(p);
+    ASSERT_INT_EQ(0, ctx.services[0].cfg.stable_after_s);
+
+    p = write_temp_config("[s]\ncommand = /bin/x\nstable_after_s = 300\n");
+    ASSERT_INT_EQ(CONFIG_OK, (int)config_load(p, &ctx)); remove(p);
+    ASSERT_INT_EQ(300, ctx.services[0].cfg.stable_after_s);
+
+    TEST("negative stable_after_s is a syntax error");
+    p = write_temp_config("[s]\ncommand = /bin/x\nstable_after_s = -1\n");
+    ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)config_load(p, &ctx)); remove(p);
+}
 
 /*
  * Regression: a [health_check] that omits interval_s / timeout_s /
@@ -522,6 +540,7 @@ int main(void) {
     test_invalid_service_name_is_error();
     test_duplicate_service_name_is_error();
     test_int_out_of_range_is_error();
+    test_stable_after_s_parsed();
 
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;

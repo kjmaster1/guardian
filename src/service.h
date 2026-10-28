@@ -105,6 +105,7 @@ typedef struct {
     int              max_retries;
     int              backoff_base_ms;
     int              backoff_max_ms;
+    int              stable_after_s;     /* uptime that resets retry_count; 0 = never */
     int              has_health_check;
     HealthCheckConfig health;
 } ServiceConfig;
@@ -113,7 +114,8 @@ typedef struct {
     PlatformPid    pid;
     PlatformHandle process_handle;
     ServiceState   state;
-    int            retry_count;
+    int            retry_count;            /* restart budget used (vs max_retries) */
+    int            total_restarts;         /* lifetime count, shown by 'status' */
     int            consecutive_failures;   /* health check fails in a row */
     int64_t        next_restart_ms;
     int64_t        started_at_ms;
@@ -245,6 +247,18 @@ int64_t service_compute_backoff_ms(const ServiceConfig *cfg, int retry_count);
  * Returns 1 if a restart was scheduled, 0 if the service gave up.
  */
 int service_schedule_restart(Service *svc);
+
+/*
+ * service_reset_retries_if_stable — forgive old crashes after stable uptime
+ *
+ * If the service is RUNNING, has used some of its restart budget, and has
+ * been up for at least cfg.stable_after_s seconds, retry_count goes back to
+ * 0. That restores the full max_retries budget and the shortest backoff
+ * delay. total_restarts is left alone so 'status' still shows history.
+ *
+ * Returns 1 if the budget was reset, 0 otherwise.
+ */
+int service_reset_retries_if_stable(Service *svc, int64_t now_ms);
 
 /*
  * service_state_name — return a human-readable name for a ServiceState

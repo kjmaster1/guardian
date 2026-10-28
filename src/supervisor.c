@@ -211,6 +211,9 @@ static void supervisor_tick(SupervisorContext *ctx) {
                     svc->rt.state = STATE_RUNNING;
                     LOG_INFO(svc->cfg.name, "Running (PID %lu)",
                              (unsigned long)svc->rt.pid);
+                } else {
+                    /* Up long enough to forgive earlier crashes? */
+                    service_reset_retries_if_stable(svc, now);
                 }
                 break;
             }

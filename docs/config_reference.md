@@ -56,6 +56,13 @@ and `.`. Any other character (spaces, quotes, ...) is a config error.
 | `max_retries` | int | `5` | Max restart attempts (crashes, health-check restarts and failed launches all count); `0` = unlimited |
 | `backoff_base_ms` | int (ms) | `1000` | Initial restart delay |
 | `backoff_max_ms` | int (ms) | `60000` | Maximum restart delay |
+| `stable_after_s` | int (s) | `60` | After this long in `RUNNING`, earlier restarts are forgiven: the `max_retries` budget and the backoff delay start over. `0` = never reset |
+
+`max_retries` is meant to catch a crash *loop*. With the default
+`stable_after_s = 60`, a service that crashes once a day never runs out of
+retries, while one that dies within a minute of every restart still ends up
+`FAILED`. The `RESTARTS` column of `guardian status` is a lifetime count and is
+not reset.
 
 ### Restart policies
 
