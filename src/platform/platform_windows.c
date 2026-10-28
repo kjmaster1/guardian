@@ -17,6 +17,11 @@
  * Without it, windows.h pulls in winsock.h which conflicts with winsock2.h.
  * Always define this before including windows.h. */
 #define WIN32_LEAN_AND_MEAN
+/* SRWLOCK (used below) needs Windows Vista or later. Older MinGW toolchains
+ * default to targeting XP, so say so explicitly. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <windows.h>      /* All Win32 API — CreateProcess, Job Objects, etc. */
 #include <winsock2.h>     /* Windows Sockets 2 — TCP/IP networking */
 #include <ws2tcpip.h>     /* getaddrinfo, inet_pton and other modern socket helpers */
@@ -27,6 +32,18 @@
 #include <string.h>    /* memset, strncpy, strlen   */
 #include <stdlib.h>    /* malloc, free               */
 #include <ctype.h>     /* toupper                    */
+
+/*
+ * g_table_lock — protects the lazily-created globals in this file
+ *
+ * Health check threads call platform_tcp_connect() and platform_spawn()
+ * concurrently with each other and with the main thread. The socket table,
+ * the Job Object and WSAStartup are all created/updated on first use, so
+ * without a lock two threads could claim the same socket-table slot (one
+ * socket leaks, and the other thread later closes the wrong one).
+ * SRWLOCK_INIT means the lock needs no runtime initialization.
+ */
+static SRWLOCK g_table_lock = SRWLOCK_INIT;
 
 /* ==========================================================================
  * Argument string helpers
@@ -89,8 +106,8 @@ static HANDLE g_job_object = NULL;
 /*
  * ensure_job_object — create the Job Object if it doesn't exist yet
  *
- * Called lazily on first spawn. Thread-safe? Not yet — Phase 5 adds locking.
- * For Phase 2, spawning happens only from the main thread.
+ * Called lazily on first spawn. Health threads spawn 'command' probes, so
+ * the caller must hold g_table_lock.
  */
 static void ensure_job_object(void) {
     if (g_job_object != NULL) return;
@@ -221,7 +238,9 @@ SpawnResult platform_spawn(const char  *command,
     result.pid    = PLATFORM_INVALID_PID;
     result.handle = PLATFORM_INVALID_HANDLE;
 
+    AcquireSRWLockExclusive(&g_table_lock);
     ensure_job_object();
+    ReleaseSRWLockExclusive(&g_table_lock);
 
     /* ----------------------------------------------------------------
      * Step 1: Build the command-line string.
@@ -882,12 +901,15 @@ void platform_ipc_close(int fd) {
  * We use a small lookup table (g_sock_table) to map between our int fd
  * abstraction and the real Windows SOCKET values.
  *
- * The table uses indices 100..115 to avoid collision with the IPC table
- * (which uses indices 0..15).
+ * The table uses indices 100..163 to avoid collision with the IPC table
+ * (which uses indices 0..15). 64 slots = one per possible health thread
+ * (GUARDIAN_MAX_SERVICES), so concurrent probes can't exhaust it.
+ *
+ * All access goes through g_table_lock: health threads connect concurrently.
  * ==========================================================================
  */
 
-#define MAX_SOCK_FDS   16
+#define MAX_SOCK_FDS   64
 #define SOCK_FD_OFFSET 100  /* our TCP fds start at 100 to separate from IPC fds */
 
 static SOCKET g_sock_table[MAX_SOCK_FDS];
@@ -900,25 +922,35 @@ static void sock_table_init_once(void) {
 }
 
 static int sock_table_alloc(SOCKET s) {
+    int fd = -1;
+    AcquireSRWLockExclusive(&g_table_lock);
     sock_table_init_once();
     for (int i = 0; i < MAX_SOCK_FDS; i++) {
         if (g_sock_table[i] == INVALID_SOCKET) {
             g_sock_table[i] = s;
-            return i + SOCK_FD_OFFSET;
+            fd = i + SOCK_FD_OFFSET;
+            break;
         }
     }
-    return -1;  /* table full */
+    ReleaseSRWLockExclusive(&g_table_lock);
+    return fd;  /* -1 = table full */
 }
 
 static SOCKET sock_table_get(int fd) {
     int i = fd - SOCK_FD_OFFSET;
     if (i < 0 || i >= MAX_SOCK_FDS) return INVALID_SOCKET;
-    return g_sock_table[i];
+    AcquireSRWLockExclusive(&g_table_lock);
+    SOCKET s = g_sock_table_init ? g_sock_table[i] : INVALID_SOCKET;
+    ReleaseSRWLockExclusive(&g_table_lock);
+    return s;
 }
 
 static void sock_table_free(int fd) {
     int i = fd - SOCK_FD_OFFSET;
-    if (i >= 0 && i < MAX_SOCK_FDS) g_sock_table[i] = INVALID_SOCKET;
+    if (i < 0 || i >= MAX_SOCK_FDS) return;
+    AcquireSRWLockExclusive(&g_table_lock);
+    g_sock_table[i] = INVALID_SOCKET;
+    ReleaseSRWLockExclusive(&g_table_lock);
 }
 
 /*
@@ -934,10 +966,13 @@ static void sock_table_free(int fd) {
  */
 static int g_wsa_init = 0;
 static void ensure_wsa(void) {
-    if (g_wsa_init) return;
-    WSADATA wd;
-    WSAStartup(MAKEWORD(2, 2), &wd);
-    g_wsa_init = 1;
+    AcquireSRWLockExclusive(&g_table_lock);
+    if (!g_wsa_init) {
+        WSADATA wd;
+        WSAStartup(MAKEWORD(2, 2), &wd);
+        g_wsa_init = 1;
+    }
+    ReleaseSRWLockExclusive(&g_table_lock);
 }
 
 /*
@@ -1040,7 +1075,9 @@ int platform_tcp_connect(const char *host, int port, int timeout_ms) {
     DWORD recv_timeout = (DWORD)timeout_ms;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&recv_timeout, sizeof(recv_timeout));
 
-    return sock_table_alloc(s);
+    int fd = sock_table_alloc(s);
+    if (fd < 0) closesocket(s);  /* table full — don't leak the socket */
+    return fd;
 }
 
 int platform_tcp_send(int fd, const char *buf, int len) {
