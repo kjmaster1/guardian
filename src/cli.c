@@ -274,6 +274,24 @@ static int cmd_start(int argc, char *argv[]) {
 
     LOG_INFO("guardian", "Configuration loaded: %d service(s)", ctx.service_count);
 
+    /*
+     * Refuse to start if another guardian already answers on this IPC path.
+     *
+     * Without this check, a second 'guardian start' on Linux unlinked the
+     * first instance's socket file and bound its own. Both then supervised
+     * the same services (duplicate processes), and 'guardian stop' reached
+     * only the second one — the first became unreachable.
+     */
+    const char *ipc_path = ctx.ipc_socket[0] ? ctx.ipc_socket : DEFAULT_IPC_PATH;
+    int probe = platform_ipc_connect(ipc_path);
+    if (probe >= 0) {
+        platform_ipc_close(probe);
+        fprintf(stderr, "guardian: another instance is already running at '%s'\n"
+                        "         Stop it first with: guardian stop %s\n",
+                ipc_path, config_path);
+        return EXIT_FAILURE;
+    }
+
     /* Print the loaded config so the user can verify before processes start */
     print_loaded_config(&ctx);
 

@@ -512,6 +512,56 @@ unhealthy_threshold = 1
         if proc:
             stop_guardian(guardian, cfg, proc)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_second_instance_is_refused(guardian, helper):
+    """
+    Starting guardian twice with the same ipc_socket must fail, and the
+    first instance must remain reachable.
+
+    Regression: on Linux the second instance unlinked the first one's socket
+    and took it over, so both supervised the same services and the first
+    could no longer be stopped with 'guardian stop'.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t7")
+        log  = os.path.join(tmpdir, "t7.log").replace("\\", "/")
+        cfg  = write_config(tmpdir, "t7.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[only-once]
+command    = {helper}
+args       = run
+stdout_log = {log}
+""")
+        proc = start_guardian(guardian, cfg)
+        wait_for_state(guardian, cfg, "only-once", "RUNNING", timeout_s=5)
+
+        TEST("second guardian with the same ipc_socket exits with an error")
+        try:
+            second = subprocess.run(
+                [guardian, "start", cfg],
+                capture_output=True,
+                timeout=10,
+            )
+            refused = second.returncode != 0
+        except subprocess.TimeoutExpired:
+            refused = False  # it started supervising — the bug
+        ASSERT(refused, "second instance started instead of refusing")
+
+        TEST("first instance is still reachable after the refused start")
+        ASSERT(
+            wait_for_state(guardian, cfg, "only-once", "RUNNING", timeout_s=3),
+            "first instance no longer answers status",
+        )
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
@@ -548,6 +598,7 @@ def main():
     test_restart_never_stays_stopped(guardian, helper)
     test_stop_command_exits_cleanly(guardian, helper)
     test_unhealthy_hung_service_is_restarted(guardian, helper)
+    test_second_instance_is_refused(guardian, helper)
 
     ok = SUMMARY()
     sys.exit(0 if ok else 1)
