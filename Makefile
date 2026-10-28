@@ -117,12 +117,14 @@ TEST_SERVICE = guardian_test_service$(TEST_EXT)
 # purest unit test in the suite: zero OS dependencies.
 TEST_LOGGER  = guardian_test_logger$(TEST_EXT)
 
+TEST_IPC = guardian_test_ipc$(TEST_EXT)
+
 # Health queue tests: circular buffer push/pop/init from health.c.
 # Needs health.c (the code under test), logger.c, platform.
 TEST_HEALTH  = guardian_test_health$(TEST_EXT)
 
 # All test binaries in one variable for the 'test' target dependency.
-TEST_BINARIES = $(TEST_CONFIG) $(TEST_SERVICE) $(TEST_LOGGER) $(TEST_HEALTH)
+TEST_BINARIES = $(TEST_CONFIG) $(TEST_SERVICE) $(TEST_LOGGER) $(TEST_IPC) $(TEST_HEALTH)
 
 # Integration test helper binary.
 # A tiny C program that guardian manages during integration tests:
@@ -176,6 +178,9 @@ $(TEST_SERVICE): tests/test_service.c src/service.c src/logger.c $(PLATFORM_SRC)
 $(TEST_LOGGER): tests/test_logger.c src/logger.c
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(TEST_IPC): tests/test_ipc.c src/logger.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 $(TEST_HEALTH): tests/test_health_queue.c src/health.c src/logger.c $(PLATFORM_SRC)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -195,6 +200,8 @@ test: $(TEST_BINARIES)
 	./$(TEST_SERVICE)
 	@echo "  ── Logger tests ───────────────────────────────────────────────"
 	./$(TEST_LOGGER)
+	@echo "  ── IPC tests ───────────────────────────────────────────────"
+	./$(TEST_IPC)
 	@echo "  ── Health queue tests ─────────────────────────────────────────"
 	./$(TEST_HEALTH)
 	@echo ""
@@ -208,6 +215,7 @@ clean:
 	rm -f guardian_test_config guardian_test_config.exe
 	rm -f guardian_test_service guardian_test_service.exe
 	rm -f guardian_test_logger  guardian_test_logger.exe
+	rm -f guardian_test_ipc guardian_test_ipc.exe
 	rm -f guardian_test_health  guardian_test_health.exe
 	rm -f tests/helper tests/helper.exe
 	rm -f *.o *.obj *.pdb
