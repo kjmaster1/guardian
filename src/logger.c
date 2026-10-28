@@ -15,6 +15,7 @@
 #include <stdarg.h>   /* va_list, va_start, va_copy, va_end           */
 #include <time.h>     /* time_t, struct tm, time(), gmtime(), strftime */
 #include <string.h>   /* strncpy                                       */
+#include <pthread.h>  /* pthread_mutex_t — health threads log too      */
 
 /*
  * Static module-level state
@@ -34,6 +35,20 @@
 static FILE *g_log_file    = NULL;
 static int   g_initialized = 0;
 
+/*
+ * g_log_lock — serializes logger_write() across threads
+ *
+ * The main loop and every health thread log. Without a lock:
+ *   1. gmtime() returns a pointer to ONE static buffer shared by the whole
+ *      process. Two threads calling it at once can read a half-overwritten
+ *      timestamp (ThreadSanitizer flags this as a data race).
+ *   2. Each log line is written with three separate fprintf calls, so two
+ *      threads' lines can interleave mid-line.
+ * Holding one mutex for the whole write fixes both. PTHREAD_MUTEX_INITIALIZER
+ * makes it usable without an init call.
+ */
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Level labels — indexed by LogLevel enum value.
  * We pad them to 5 chars so the output columns align neatly. */
 static const char *LEVEL_LABELS[] = {
@@ -44,11 +59,13 @@ static const char *LEVEL_LABELS[] = {
 };
 
 void logger_init(const char *log_file_path) {
+    pthread_mutex_lock(&g_log_lock);
     g_initialized = 1;
 
     if (log_file_path == NULL || log_file_path[0] == '\0') {
         /* No file path provided — stdout only. */
         g_log_file = NULL;
+        pthread_mutex_unlock(&g_log_lock);
         return;
     }
 
@@ -68,9 +85,12 @@ void logger_init(const char *log_file_path) {
         fprintf(stderr, "[guardian] WARNING: could not open log file '%s', "
                         "falling back to stdout\n", log_file_path);
     }
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 void logger_write(LogLevel level, const char *service, const char *fmt, ...) {
+    pthread_mutex_lock(&g_log_lock);
+
     /*
      * Step 1: Build the timestamp string.
      *
@@ -154,6 +174,10 @@ void logger_write(LogLevel level, const char *service, const char *fmt, ...) {
     fprintf(stdout, "[%s][%s][%s] ", LEVEL_LABELS[level], svc_field, timestamp);
     vfprintf(stdout, fmt, args);
     fprintf(stdout, "\n");
+    /* When stdout is a pipe or file (systemd, Docker, '> out.log'), the C
+     * runtime switches it to full buffering and lines can sit unwritten for
+     * kilobytes. Flush so the log stream is always current. */
+    fflush(stdout);
 
     /* Write to file if configured */
     if (write_to_file) {
@@ -172,13 +196,17 @@ void logger_write(LogLevel level, const char *service, const char *fmt, ...) {
 
     va_end(args);
     (void)g_initialized; /* suppress unused variable warning in Phase 1 */
+
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 void logger_close(void) {
+    pthread_mutex_lock(&g_log_lock);
     if (g_log_file != NULL) {
         fflush(g_log_file);
         fclose(g_log_file);
         g_log_file = NULL;
     }
     g_initialized = 0;
+    pthread_mutex_unlock(&g_log_lock);
 }
