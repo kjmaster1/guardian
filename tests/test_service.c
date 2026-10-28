@@ -205,6 +205,60 @@ static void test_backoff_small_base(void) {
 }
 
 /* ==========================================================================
+ * service_schedule_restart() tests
+ *
+ * Regression: crash restarts checked max_retries, but restarts caused by
+ * health-check failures and spawn failures did not — those services could
+ * restart forever even with max_retries = 2. All three paths now share
+ * service_schedule_restart(), so testing it covers all of them.
+ * ==========================================================================
+ */
+
+static Service make_svc(int max_retries) {
+    Service svc;
+    memset(&svc, 0, sizeof(svc));
+    svc.cfg.max_retries     = max_retries;
+    svc.cfg.backoff_base_ms = 1000;
+    svc.cfg.backoff_max_ms  = 60000;
+    return svc;
+}
+
+static void test_schedule_restart_enters_backoff(void) {
+    TEST("schedule_restart under max_retries enters BACKOFF with a future restart time");
+    Service svc = make_svc(2);
+
+    int64_t before = platform_now_ms();
+    int scheduled  = service_schedule_restart(&svc);
+
+    ASSERT_INT_EQ(1, scheduled);
+    ASSERT_INT_EQ((int)STATE_BACKOFF, (int)svc.rt.state);
+    ASSERT_INT_EQ(1, svc.rt.retry_count);
+    ASSERT(svc.rt.next_restart_ms > before);
+}
+
+static void test_schedule_restart_gives_up_after_max(void) {
+    TEST("schedule_restart past max_retries enters FAILED");
+    Service svc = make_svc(2);
+
+    service_schedule_restart(&svc);              /* attempt 1 */
+    service_schedule_restart(&svc);              /* attempt 2 */
+    int scheduled = service_schedule_restart(&svc);  /* attempt 3 > max */
+
+    ASSERT_INT_EQ(0, scheduled);
+    ASSERT_INT_EQ((int)STATE_FAILED, (int)svc.rt.state);
+}
+
+static void test_schedule_restart_unlimited(void) {
+    TEST("schedule_restart with max_retries = 0 never gives up");
+    Service svc = make_svc(0);
+
+    for (int i = 0; i < 100; i++) service_schedule_restart(&svc);
+
+    ASSERT_INT_EQ((int)STATE_BACKOFF, (int)svc.rt.state);
+    ASSERT_INT_EQ(100, svc.rt.retry_count);
+}
+
+/* ==========================================================================
  * Test runner
  * ==========================================================================
  */
@@ -232,6 +286,10 @@ int main(void) {
     test_backoff_max_equals_base();
     test_backoff_small_base();
 
+    /* service_schedule_restart */
+    test_schedule_restart_enters_backoff();
+    test_schedule_restart_gives_up_after_max();
+    test_schedule_restart_unlimited();
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

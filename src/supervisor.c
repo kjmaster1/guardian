@@ -59,22 +59,12 @@ static void handle_exited_service(SupervisorContext *ctx, int index,
         if (svc->rt.health_triggered_stop) {
             /*
              * This stop was triggered by repeated health check failures,
-             * not by a user 'stop' command. We want to restart it —
-             * go to BACKOFF so the event loop will re-launch it after a delay.
-             *
-             * We increment retry_count so backoff delays accumulate if the
-             * service keeps failing its health check on each restart.
+             * not by a user 'stop' command. We want to restart it, subject
+             * to the same max_retries limit as a crash.
              */
             svc->rt.health_triggered_stop = 0;
-            svc->rt.retry_count++;
-            svc->rt.next_restart_ms = service_compute_backoff_ms(
-                &svc->cfg, svc->rt.retry_count);
-            svc->rt.state = STATE_BACKOFF;
-
-            int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();
-            LOG_INFO(svc->cfg.name,
-                     "Stopped after health failure — will restart in %.1fs",
-                     (double)delay_ms / 1000.0);
+            LOG_INFO(svc->cfg.name, "Stopped after health failure");
+            service_schedule_restart(svc);
         } else {
             /* Normal intentional stop */
             LOG_INFO(svc->cfg.name, "Stopped (exit code %d)", status.exit_code);
@@ -108,35 +98,8 @@ static void handle_exited_service(SupervisorContext *ctx, int index,
         return;
     }
 
-    /*
-     * Check if we've exceeded max_retries.
-     * max_retries == 0 means unlimited — we never give up.
-     */
-    svc->rt.retry_count++;
-
-    if (svc->cfg.max_retries > 0 &&
-        svc->rt.retry_count > svc->cfg.max_retries) {
-        LOG_ERROR(svc->cfg.name,
-                  "Giving up after %d restart attempts (max_retries = %d)",
-                  svc->rt.retry_count - 1, svc->cfg.max_retries);
-        svc->rt.state = STATE_FAILED;
-        return;
-    }
-
-    /*
-     * Go to BACKOFF. The event loop will check next_restart_ms each tick
-     * and call service_start() when the delay has elapsed.
-     */
-    svc->rt.next_restart_ms = service_compute_backoff_ms(&svc->cfg,
-                                                          svc->rt.retry_count);
-    svc->rt.state = STATE_BACKOFF;
-
-    int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();
-    LOG_INFO(svc->cfg.name,
-             "Will restart in %.1fs (attempt %d%s)",
-             (double)delay_ms / 1000.0,
-             svc->rt.retry_count,
-             svc->cfg.max_retries > 0 ? "" : ", unlimited retries");
+    /* BACKOFF, or FAILED once max_retries is exhausted */
+    service_schedule_restart(svc);
 }
 
 /* ==========================================================================

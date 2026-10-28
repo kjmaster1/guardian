@@ -53,7 +53,7 @@ and `.`. Any other character (spaces, quotes, ...) is a config error.
 |---|---|---|---|
 | `autostart` | bool | `true` | Start automatically when guardian launches |
 | `restart` | enum | `on_failure` | When to restart: `never`, `on_failure`, `always` |
-| `max_retries` | int | `5` | Max restart attempts; `0` = unlimited |
+| `max_retries` | int | `5` | Max restart attempts (crashes, health-check restarts and failed launches all count); `0` = unlimited |
 | `backoff_base_ms` | int (ms) | `1000` | Initial restart delay |
 | `backoff_max_ms` | int (ms) | `60000` | Maximum restart delay |
 

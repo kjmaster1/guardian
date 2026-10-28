@@ -76,6 +76,47 @@ int64_t service_compute_backoff_ms(const ServiceConfig *cfg, int retry_count) {
 }
 
 /* ==========================================================================
+ * service_schedule_restart — the single place restart attempts are counted
+ *
+ * Before this existed, the crash path checked max_retries but the
+ * health-failure and spawn-failure paths did their own retry_count++ and went
+ * straight to BACKOFF. A service that kept failing its health check (or whose
+ * executable could not be spawned) restarted forever, ignoring max_retries.
+ * Duplicated logic drifts apart; one shared function cannot.
+ * ==========================================================================
+ */
+
+int service_schedule_restart(Service *svc) {
+    /* max_retries == 0 means unlimited — we never give up. */
+    svc->rt.retry_count++;
+
+    if (svc->cfg.max_retries > 0 &&
+        svc->rt.retry_count > svc->cfg.max_retries) {
+        LOG_ERROR(svc->cfg.name,
+                  "Giving up after %d restart attempts (max_retries = %d)",
+                  svc->rt.retry_count - 1, svc->cfg.max_retries);
+        svc->rt.state = STATE_FAILED;
+        return 0;
+    }
+
+    /*
+     * Go to BACKOFF. The event loop will check next_restart_ms each tick
+     * and call service_start() when the delay has elapsed.
+     */
+    svc->rt.next_restart_ms = service_compute_backoff_ms(&svc->cfg,
+                                                          svc->rt.retry_count);
+    svc->rt.state = STATE_BACKOFF;
+
+    int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();
+    LOG_INFO(svc->cfg.name,
+             "Will restart in %.1fs (attempt %d%s)",
+             (double)delay_ms / 1000.0,
+             svc->rt.retry_count,
+             svc->cfg.max_retries > 0 ? "" : ", unlimited retries");
+    return 1;
+}
+
+/* ==========================================================================
  * service_start — spawn the process for one service
  * ==========================================================================
  */
@@ -132,11 +173,10 @@ int service_start(SupervisorContext *ctx, int index) {
          * go to BACKOFF so guardian will try again after a delay.
          * Don't give up immediately on a spawn failure; the executable
          * might not exist YET (e.g., built by another process).
+         * max_retries still applies, so a permanently missing executable
+         * ends in FAILED instead of retrying forever.
          */
-        svc->rt.state             = STATE_BACKOFF;
-        svc->rt.retry_count++;
-        svc->rt.next_restart_ms   = service_compute_backoff_ms(&svc->cfg,
-                                                                svc->rt.retry_count);
+        service_schedule_restart(svc);
         return 0;
     }
 

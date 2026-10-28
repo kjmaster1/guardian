@@ -211,6 +211,20 @@ void service_stop(SupervisorContext *ctx, int index);
 int64_t service_compute_backoff_ms(const ServiceConfig *cfg, int retry_count);
 
 /*
+ * service_schedule_restart — count one restart attempt and pick the next state
+ *
+ * Every path that wants to restart a service (crash, health-check failure,
+ * spawn failure) goes through here, so max_retries is enforced the same way
+ * for all of them.
+ *
+ * Increments retry_count. If max_retries (> 0) is exceeded the service moves
+ * to STATE_FAILED; otherwise to STATE_BACKOFF with next_restart_ms set.
+ *
+ * Returns 1 if a restart was scheduled, 0 if the service gave up.
+ */
+int service_schedule_restart(Service *svc);
+
+/*
  * service_state_name — return a human-readable name for a ServiceState
  *
  * Useful for log messages and status output.
