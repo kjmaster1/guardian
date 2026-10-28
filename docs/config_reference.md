@@ -98,6 +98,8 @@ to that service. Each service may have at most one health check.
 | `timeout_s` | int (s) | `3` | Seconds before a probe is considered failed |
 | `unhealthy_threshold` | int | `3` | Consecutive failures before triggering a restart |
 
+Only probes taken while the service is `RUNNING` count towards the threshold.
+
 ### Type: tcp
 
 Attempts a TCP connection to `host:port`. Succeeds if the connection is

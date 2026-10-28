@@ -198,6 +198,11 @@ int service_start(SupervisorContext *ctx, int index) {
     svc->rt.state          = STATE_STARTING;
     svc->rt.started_at_ms  = platform_now_ms();
 
+    /* A fresh process starts with a clean health record. Otherwise failures
+     * counted against the previous process would carry over, and the new one
+     * could be killed by its very first failed probe. */
+    svc->rt.consecutive_failures = 0;
+
     LOG_INFO(svc->cfg.name, "Started with PID %lu",
              (unsigned long)spawn.pid);
 

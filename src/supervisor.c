@@ -116,8 +116,12 @@ static void handle_exited_service(SupervisorContext *ctx, int index,
  *   - unhealthy: increment counter; if it reaches the threshold, stop and
  *                restart the service (via health_triggered_stop flag)
  *
- * We only act on services in STATE_RUNNING — there's no point restarting
- * a service that's already stopping, in backoff, or stopped.
+ * We only count results for services in STATE_RUNNING. The health thread
+ * keeps probing while a service is in BACKOFF or STOPPING, and those probes
+ * naturally fail (nothing is listening). Counting them used to pile up
+ * failures during the backoff delay, so the restarted process was killed
+ * again by its first failed probe — a restart loop the threshold was meant
+ * to prevent.
  */
 static void drain_health_queue(SupervisorContext *ctx) {
     HealthResult hr;
@@ -126,6 +130,8 @@ static void drain_health_queue(SupervisorContext *ctx) {
         for (int i = 0; i < ctx->service_count; i++) {
             Service *svc = &ctx->services[i];
             if (strcmp(svc->cfg.name, hr.service_name) != 0) continue;
+
+            if (svc->rt.state != STATE_RUNNING) break;
 
             if (hr.healthy) {
                 if (svc->rt.consecutive_failures > 0) {
@@ -142,8 +148,7 @@ static void drain_health_queue(SupervisorContext *ctx) {
                          "Health check failed (%d/%d)",
                          svc->rt.consecutive_failures, threshold);
 
-                if (svc->rt.state == STATE_RUNNING &&
-                    svc->rt.consecutive_failures >= threshold) {
+                if (svc->rt.consecutive_failures >= threshold) {
                     LOG_WARN(svc->cfg.name,
                              "Unhealthy threshold reached — stopping for restart");
                     svc->rt.consecutive_failures   = 0;
