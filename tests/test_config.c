@@ -437,6 +437,42 @@ static void test_health_check_without_target_is_error(void) {
 
     ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)err);
 }
+
+/*
+ * Regression: names are copied verbatim into the JSON status reply, so a
+ * name containing '"' produced invalid JSON.
+ */
+static void test_invalid_service_name_is_error(void) {
+    TEST("service name with characters outside [A-Za-z0-9._-] is rejected");
+
+    const char *ini = "[a\"b]\ncommand = /bin/x\n";
+
+    char *path = write_temp_config(ini);
+    SupervisorContext ctx;
+    ConfigError err = config_load(path, &ctx);
+    remove(path);
+
+    ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)err);
+}
+
+/*
+ * Regression: health results are routed to services by name, so a second
+ * service with the same name never received its own health results.
+ */
+static void test_duplicate_service_name_is_error(void) {
+    TEST("two services with the same name are rejected");
+
+    const char *ini =
+        "[api]\ncommand = /bin/a\n"
+        "[api]\ncommand = /bin/b\n";
+
+    char *path = write_temp_config(ini);
+    SupervisorContext ctx;
+    ConfigError err = config_load(path, &ctx);
+    remove(path);
+
+    ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)err);
+}
 /* ==========================================================================
  * Test runner
  * ==========================================================================
@@ -465,6 +501,8 @@ int main(void) {
     test_default_values_applied();
     test_health_check_defaults_applied();
     test_health_check_without_target_is_error();
+    test_invalid_service_name_is_error();
+    test_duplicate_service_name_is_error();
 
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;

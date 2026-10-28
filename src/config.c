@@ -124,6 +124,23 @@ static int parse_health_type(const char *s, HealthCheckType *out) {
     return 0;
 }
 
+/*
+ * is_valid_service_name — allow only [A-Za-z0-9._-], non-empty
+ *
+ * The name ends up inside the JSON status reply, in log lines, and on the
+ * 'guardian logs <name>' command line. Restricting the character set means
+ * none of those places ever has to escape anything.
+ */
+static int is_valid_service_name(const char *s) {
+    if (*s == '\0') return 0;
+    for (; *s; s++) {
+        if (!isalnum((unsigned char)*s) && *s != '-' && *s != '_' && *s != '.') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* ==========================================================================
  * Section type — tracks where we are in the INI file
  * ========================================================================== */
@@ -257,6 +274,24 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                 }
 
             } else {
+                if (!is_valid_service_name(section_name)) {
+                    LOG_ERROR("guardian",
+                              "Config line %d: invalid service name '%s' "
+                              "(allowed: letters, digits, '-', '_', '.')",
+                              line_number, section_name);
+                    fclose(f);
+                    return CONFIG_ERR_SYNTAX;
+                }
+                for (int i = 0; i < ctx->service_count; i++) {
+                    if (strcmp(ctx->services[i].cfg.name, section_name) == 0) {
+                        LOG_ERROR("guardian",
+                                  "Config line %d: duplicate service name '%s'",
+                                  line_number, section_name);
+                        fclose(f);
+                        return CONFIG_ERR_SYNTAX;
+                    }
+                }
+
                 /* Any other [name] is a new service section */
                 if (ctx->service_count >= GUARDIAN_MAX_SERVICES) {
                     LOG_ERROR("guardian",

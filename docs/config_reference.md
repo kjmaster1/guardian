@@ -28,6 +28,9 @@ section entirely and rely on defaults.
 Defines one managed process. The section name is the service's display name in
 logs and `guardian status` output. You may define up to 64 services.
 
+Service names must be unique and may contain only letters, digits, `-`, `_`
+and `.`. Any other character (spaces, quotes, ...) is a config error.
+
 ### Required
 
 | Key | Type | Description |
