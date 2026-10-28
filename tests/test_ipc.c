@@ -36,6 +36,8 @@ int main(void) {
 #ifdef _WIN32
     test_pipe_recovers_after_early_hangup();
 #else
+    /* No TEST() runs on this platform, so silence -Werror=unused-variable */
+    (void)g_current_test;
     printf("  (named pipe test is Windows-only, skipped)\n");
 #endif
     SUMMARY();

@@ -41,7 +41,9 @@
     #define PLATFORM_INVALID_PID     ((PlatformPid)0)
     #define PLATFORM_INVALID_HANDLE  INVALID_HANDLE_VALUE
 #else
-    #include <unistd.h>   /* pid_t */
+    /* pid_t comes from <sys/types.h>. <unistd.h> hides it under -std=c11
+     * unless _POSIX_C_SOURCE is defined, so this header can't rely on it. */
+    #include <sys/types.h>
     typedef pid_t   PlatformPid;
     typedef int     PlatformHandle;   /* unused on POSIX, always -1 */
     #define PLATFORM_INVALID_PID     ((PlatformPid)(-1))
