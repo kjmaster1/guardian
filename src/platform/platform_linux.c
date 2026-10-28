@@ -536,7 +536,26 @@ void platform_socket_close(int fd) {
 static int  g_ipc_server_fd         = -1;
 static char g_ipc_socket_path[512]  = "";
 
+/*
+ * fits_sun_path — sockaddr_un.sun_path is only 108 bytes on Linux
+ *
+ * strncpy into sun_path silently truncates a longer path, so guardian would
+ * bind (or connect) to a DIFFERENT file than the one in the config — and
+ * unlink() the full-length path, which isn't the socket at all. Reject
+ * instead of guessing.
+ */
+static int fits_sun_path(const char *path) {
+    struct sockaddr_un addr;
+    return strlen(path) < sizeof(addr.sun_path);
+}
+
 int platform_ipc_listen(const char *path) {
+    if (!fits_sun_path(path)) {
+        fprintf(stderr, "[guardian] ipc_socket path too long (max %zu chars): %s\n",
+                sizeof(((struct sockaddr_un *)0)->sun_path) - 1, path);
+        return -1;
+    }
+
     /*
      * AF_UNIX  = "this is a local socket, not TCP"
      * SOCK_STREAM = "reliable, in-order byte stream" (same as TCP semantics)
@@ -620,6 +639,8 @@ int platform_ipc_accept(int server_fd) {
 }
 
 int platform_ipc_connect(const char *path) {
+    if (!fits_sun_path(path)) return -1;
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
