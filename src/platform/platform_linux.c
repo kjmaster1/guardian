@@ -394,8 +394,13 @@ int platform_terminate(PlatformPid pid, PlatformHandle handle) {
      * SIGTERM is the polite termination signal — the process can catch it
      * and clean up gracefully (flush buffers, delete temp files, etc.).
      * Most well-behaved daemons handle SIGTERM.
+     *
+     * The pid <= 0 guard matters: kill(0, sig) signals our whole process
+     * group and kill(-1, sig) signals EVERY process this user owns.
+     * PLATFORM_INVALID_PID is -1, so a stale pid must never reach kill().
      */
     (void)handle;
+    if (pid <= 0) return -1;
     return kill(pid, SIGTERM) == 0 ? 0 : -1;
 }
 
@@ -405,6 +410,7 @@ int platform_kill(PlatformPid pid, PlatformHandle handle) {
      * immediately. Used as a last resort after SIGTERM + timeout.
      */
     (void)handle;
+    if (pid <= 0) return -1;  /* see platform_terminate */
     return kill(pid, SIGKILL) == 0 ? 0 : -1;
 }
 
