@@ -17,6 +17,7 @@
 #include <stdlib.h>   /* strtol                                             */
 #include <ctype.h>    /* isspace — check if a char is a whitespace char    */
 #include <errno.h>    /* errno — the OS sets this when operations fail      */
+#include <limits.h>   /* INT_MIN, INT_MAX                                   */
 
 /* ==========================================================================
  * Internal helpers (static = private to this file)
@@ -81,9 +82,14 @@ static int parse_int(const char *s, int *out) {
     /* Failure conditions:
      *   errno != 0    → overflow or underflow
      *   end == s      → no digits were consumed (empty string or garbage)
-     *   *end != '\0'  → trailing non-numeric characters */
+     *   *end != '\0'  → trailing non-numeric characters
+     *   out of int range → long is 64-bit on Linux, so strtol accepts values
+     *                      that the (int) cast below would silently truncate */
     if (errno != 0 || end == s || *end != '\0') {
         return 0;  /* failure */
+    }
+    if (val < INT_MIN || val > INT_MAX) {
+        return 0;
     }
 
     *out = (int)val;

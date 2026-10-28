@@ -473,6 +473,24 @@ static void test_duplicate_service_name_is_error(void) {
 
     ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)err);
 }
+
+/*
+ * Regression: strtol() returns a long, which is 64-bit on Linux. A value
+ * that fits in a long but not an int was silently truncated by the cast.
+ */
+static void test_int_out_of_range_is_error(void) {
+    TEST("integer value larger than INT_MAX is rejected, not truncated");
+
+    const char *ini = "[svc]\ncommand = /bin/x\nmax_retries = 4294967297\n";
+
+    char *path = write_temp_config(ini);
+    SupervisorContext ctx;
+    ConfigError err = config_load(path, &ctx);
+    remove(path);
+
+    ASSERT_INT_EQ(CONFIG_ERR_SYNTAX, (int)err);
+}
+
 /* ==========================================================================
  * Test runner
  * ==========================================================================
@@ -503,6 +521,7 @@ int main(void) {
     test_health_check_without_target_is_error();
     test_invalid_service_name_is_error();
     test_duplicate_service_name_is_error();
+    test_int_out_of_range_is_error();
 
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
