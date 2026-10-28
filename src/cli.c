@@ -340,8 +340,14 @@ static int cmd_version(void) {
  * program flow (i.e., from a signal handler). Without volatile, the compiler
  * might cache g_logs_running in a register and never re-read it from memory,
  * causing the follow loop to run forever even after Ctrl+C.
+ *
+ * 'sig_atomic_t' is the one integer type the C standard guarantees can be
+ * written from a signal handler in a single, uninterruptible step. Here only
+ * the main thread and the handler touch it, so volatile sig_atomic_t is
+ * enough (the supervisor's flag is read by several threads and uses
+ * atomic_int instead).
  */
-static volatile int g_logs_running = 1;
+static volatile sig_atomic_t g_logs_running = 1;
 
 static void logs_signal_handler(int signum) {
     (void)signum;
