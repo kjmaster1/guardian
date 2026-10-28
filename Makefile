@@ -65,11 +65,11 @@ else
         TARGET       = guardian
         TEST_EXT     =
     endif
-    ifeq ($(UNAME),Darwin)
-        PLATFORM_SRC = src/platform/platform_macos.c
-        LDFLAGS     += -lpthread
-        TARGET       = guardian
-        TEST_EXT     =
+    # Anything else (macOS, BSD, ...) has no platform layer yet. Fail with a
+    # clear message instead of the old Darwin branch, which pointed at a
+    # platform_macos.c that doesn't exist and died with "No rule to make target".
+    ifneq ($(UNAME),Linux)
+        $(error Unsupported platform '$(UNAME)': guardian builds on Linux and Windows only)
     endif
 endif
 
