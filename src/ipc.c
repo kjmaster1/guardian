@@ -134,7 +134,7 @@ static void dispatch_command(SupervisorContext *ctx,
      * We use it to check which command the client sent.
      */
     if (strstr(msg, "\"stop\"")) {
-        /* Tell the main loop to stop on the next tick */
+        /* Tell the main loop to stop on the next tick (atomic store) */
         ctx->running = 0;
         snprintf(response, sizeof(response), "{\"ok\":true}");
         LOG_INFO("guardian", "Stop command received via IPC");

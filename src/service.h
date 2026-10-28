@@ -164,7 +164,23 @@ typedef struct {
     int          service_count;
     char         log_file[GUARDIAN_MAX_PATH];
     char         ipc_socket[GUARDIAN_MAX_PATH];
-    volatile int running;
+
+    /*
+     * running — 1 while the supervisor should keep going, 0 to shut down.
+     *
+     * Written by: the signal handler (Ctrl+C / SIGTERM), the IPC 'stop'
+     * command, and on Windows the console-control thread.
+     * Read by:    the main loop AND every health thread.
+     *
+     * Why atomic_int and not 'volatile int'?
+     * volatile only stops the compiler caching the value in a register.
+     * It does NOT make concurrent access from several threads well-defined —
+     * in C11 that is a data race, which is undefined behaviour (and
+     * ThreadSanitizer reports it). atomic_int makes every read and write a
+     * single indivisible operation that other threads are guaranteed to see.
+     * A lock-free atomic is also allowed to be written from a signal handler.
+     */
+    atomic_int   running;
 
     /*
      * Health subsystem — owned by health.c, initialized by health_queue_init().

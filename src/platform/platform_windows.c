@@ -430,13 +430,13 @@ void platform_close_handle(PlatformHandle handle) {
  * reach it. This is safe because there is only ever one supervisor instance.
  * ==========================================================================
  */
-static volatile int *g_shutdown_flag = NULL;
+static atomic_int *g_shutdown_flag = NULL;
 
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     /*
      * This function is called by Windows on a SEPARATE THREAD when a
-     * control event arrives. That's why the shutdown flag must be volatile —
-     * the main thread reads it, this thread writes it.
+     * control event arrives. That's why the shutdown flag must be atomic —
+     * this thread writes it while the main and health threads read it.
      *
      * We handle all event types the same way: set the flag and return TRUE.
      * Returning TRUE tells Windows "we handled it — don't terminate the process."
@@ -457,7 +457,7 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     }
 }
 
-void platform_install_signal_handlers(volatile int *shutdown_flag) {
+void platform_install_signal_handlers(atomic_int *shutdown_flag) {
     g_shutdown_flag = shutdown_flag;
     /*
      * SetConsoleCtrlHandler(handler, add)

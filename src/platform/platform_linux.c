@@ -110,7 +110,7 @@ void platform_sleep_ms(int ms) {
  * Passing the flag via a pointer (rather than using a global int) keeps
  * the signal handling decoupled from the supervisor's data structures.
  */
-static volatile int *g_shutdown_flag = NULL;
+static atomic_int *g_shutdown_flag = NULL;
 
 static void signal_handler(int signum) {
     /*
@@ -118,13 +118,13 @@ static void signal_handler(int signum) {
      * functions are allowed. That rules out printf, malloc, mutex locks, etc.
      * (They could be mid-execution when the signal arrives, causing deadlock.)
      *
-     * Writing to a volatile int is safe. That's all we do here.
+     * Storing to a lock-free atomic_int is safe. That's all we do here.
      */
     (void)signum;
     if (g_shutdown_flag) *g_shutdown_flag = 0;
 }
 
-void platform_install_signal_handlers(volatile int *shutdown_flag) {
+void platform_install_signal_handlers(atomic_int *shutdown_flag) {
     g_shutdown_flag = shutdown_flag;
 
     /*
