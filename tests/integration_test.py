@@ -135,6 +135,18 @@ def service_is_in_state(status_output, service_name, state):
     return False
 
 
+def status_row(status_output, service_name):
+    """
+    Return the status table row for a service as a list of columns
+    [name, state, pid, restarts, uptime], or None if it isn't listed.
+    """
+    for line in status_output.splitlines():
+        cols = line.split()
+        if cols and cols[0] == service_name:
+            return cols
+    return None
+
+
 def wait_for_state(guardian, config, service, state, timeout_s=5):
     """
     Poll 'guardian status' every 200ms until the named service reaches
@@ -375,6 +387,15 @@ stdout_log      = {log}
         ASSERT(
             service_is_in_state(status, "no-restart-svc", "STOPPED"),
             f"service left STOPPED state unexpectedly. Status:\n{status}",
+        )
+
+        # Regression: on Linux the "no process" pid is -1, which used to be
+        # printed as 18446744073709551615 and shown truncated in the table.
+        TEST("stopped service reports PID 0")
+        row = status_row(status, "no-restart-svc")
+        ASSERT(
+            row is not None and row[2] == "0",
+            f"expected PID column '0', got row {row}",
         )
 
     finally:
