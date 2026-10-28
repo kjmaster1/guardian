@@ -52,13 +52,22 @@
  */
 static void build_status_response(const SupervisorContext *ctx,
                                    char *buf, int buf_size) {
-    int pos = 0;
-
-    pos += snprintf(buf + pos, buf_size - pos,
-                    "{\"ok\":true,\"services\":[");
+    /*
+     * Careful: snprintf returns the length it WOULD have written, not what
+     * it actually wrote. If an entry is truncated, 'pos' ends up past the
+     * end of buf, 'buf_size - pos' goes negative, and converted to size_t
+     * that is an enormous size — the next snprintf then writes out of bounds.
+     * So each entry is formatted into a small buffer first and only appended
+     * if it fits, always leaving room for the closing "]}".
+     */
+    int pos = snprintf(buf, buf_size, "{\"ok\":true,\"services\":[");
 
     for (int i = 0; i < ctx->service_count; i++) {
         const Service *svc = &ctx->services[i];
+
+        int has_process = svc->rt.state == STATE_STARTING ||
+                          svc->rt.state == STATE_RUNNING  ||
+                          svc->rt.state == STATE_STOPPING;
 
         /* Calculate uptime in seconds.
          * platform_now_ms() - started_at_ms gives elapsed milliseconds.
@@ -70,8 +79,16 @@ static void build_status_response(const SupervisorContext *ctx,
             uptime_s = (platform_now_ms() - svc->rt.started_at_ms) / 1000;
         }
 
+        /*
+         * pid is reported as 0 when there is no process. On Linux the
+         * "no process" value is -1, which printed through %lu came out as
+         * 18446744073709551615 (and the CLI then cut it to 15 digits).
+         */
+        unsigned long pid = has_process ? (unsigned long)svc->rt.pid : 0UL;
+
         /* All values are quoted strings — keeps our simple parser uniform */
-        pos += snprintf(buf + pos, buf_size - pos,
+        char entry[256];
+        int n = snprintf(entry, sizeof(entry),
             "%s{"
             "\"name\":\"%s\","
             "\"state\":\"%s\","
@@ -82,16 +99,18 @@ static void build_status_response(const SupervisorContext *ctx,
             i > 0 ? "," : "",
             svc->cfg.name,
             service_state_name(svc->rt.state),
-            (unsigned long)svc->rt.pid,
-            svc->rt.retry_count,
+            pid,
+            svc->rt.total_restarts,  /* lifetime, not the resettable budget */
             (long long)uptime_s
         );
 
-        /* Safety: if we're close to the buffer limit, stop early */
-        if (pos >= buf_size - 64) break;
+        /* +3 = "]}" plus the terminator. A shorter list beats broken JSON. */
+        if (n < 0 || n >= (int)sizeof(entry) || pos + n + 3 > buf_size) break;
+        memcpy(buf + pos, entry, (size_t)n);
+        pos += n;
     }
 
-    pos += snprintf(buf + pos, buf_size - pos, "]}");
+    snprintf(buf + pos, buf_size - pos, "]}");
 }
 
 /* ==========================================================================
@@ -115,7 +134,7 @@ static void dispatch_command(SupervisorContext *ctx,
      * We use it to check which command the client sent.
      */
     if (strstr(msg, "\"stop\"")) {
-        /* Tell the main loop to stop on the next tick */
+        /* Tell the main loop to stop on the next tick (atomic store) */
         ctx->running = 0;
         snprintf(response, sizeof(response), "{\"ok\":true}");
         LOG_INFO("guardian", "Stop command received via IPC");
@@ -198,22 +217,9 @@ int ipc_send_command(const char *ipc_path,
      * 3. Read the response
      * 4. Close
      *
-     * On failure (daemon not running), we get -1 back from platform_ipc_accept
-     * and report a helpful error.
-     *
-     * We reuse the IPC fd interface here. platform_ipc_listen opens a SERVER.
-     * For the client we need a different function — platform_ipc_connect.
-     * Rather than add another platform function, we use a small trick:
-     * platform_ipc_accept is overloaded to work as platform_ipc_connect
-     * when passed the special value -1 along with the path embedded in
-     * the server_fd... actually, let's just add the client function properly.
-     *
-     * For now: platform_ipc_accept(-1) is used as a client connect signal.
-     * The platform implementation handles this distinction.
-     * See platform_windows.c for the implementation detail.
+     * On failure (daemon not running), platform_ipc_connect returns -1
+     * and we report a helpful error.
      */
-
-    /* Use a special sentinel fd (-2) to signal "I am a client, connect to path" */
     int fd = platform_ipc_connect(ipc_path);
     if (fd < 0) {
         fprintf(stderr, "guardian: cannot connect to daemon at '%s'\n"

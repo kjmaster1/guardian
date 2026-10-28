@@ -17,6 +17,7 @@
 #include <stdlib.h>   /* strtol                                             */
 #include <ctype.h>    /* isspace — check if a char is a whitespace char    */
 #include <errno.h>    /* errno — the OS sets this when operations fail      */
+#include <limits.h>   /* INT_MIN, INT_MAX                                   */
 
 /* ==========================================================================
  * Internal helpers (static = private to this file)
@@ -81,9 +82,14 @@ static int parse_int(const char *s, int *out) {
     /* Failure conditions:
      *   errno != 0    → overflow or underflow
      *   end == s      → no digits were consumed (empty string or garbage)
-     *   *end != '\0'  → trailing non-numeric characters */
+     *   *end != '\0'  → trailing non-numeric characters
+     *   out of int range → long is 64-bit on Linux, so strtol accepts values
+     *                      that the (int) cast below would silently truncate */
     if (errno != 0 || end == s || *end != '\0') {
         return 0;  /* failure */
+    }
+    if (val < INT_MIN || val > INT_MAX) {
+        return 0;
     }
 
     *out = (int)val;
@@ -122,6 +128,23 @@ static int parse_health_type(const char *s, HealthCheckType *out) {
     if (strcmp(s, "http") == 0)    { *out = HEALTH_HTTP;    return 1; }
     if (strcmp(s, "command") == 0) { *out = HEALTH_COMMAND; return 1; }
     return 0;
+}
+
+/*
+ * is_valid_service_name — allow only [A-Za-z0-9._-], non-empty
+ *
+ * The name ends up inside the JSON status reply, in log lines, and on the
+ * 'guardian logs <name>' command line. Restricting the character set means
+ * none of those places ever has to escape anything.
+ */
+static int is_valid_service_name(const char *s) {
+    if (*s == '\0') return 0;
+    for (; *s; s++) {
+        if (!isalnum((unsigned char)*s) && *s != '-' && *s != '_' && *s != '.') {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* ==========================================================================
@@ -244,9 +267,37 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                     return CONFIG_ERR_SYNTAX;
                 }
                 current_section = SECTION_HEALTH_CHECK;
-                ctx->services[current_svc_idx].cfg.has_health_check = 1;
+
+                /* Documented defaults (docs/config_reference.md). Without
+                 * these, an omitted interval_s stays 0 and the health thread
+                 * probes in a tight loop with no sleep at all. */
+                ServiceConfig *hc_owner = &ctx->services[current_svc_idx].cfg;
+                if (!hc_owner->has_health_check) {
+                    hc_owner->has_health_check           = 1;
+                    hc_owner->health.interval_s          = 10;
+                    hc_owner->health.timeout_s           = 3;
+                    hc_owner->health.unhealthy_threshold = 3;
+                }
 
             } else {
+                if (!is_valid_service_name(section_name)) {
+                    LOG_ERROR("guardian",
+                              "Config line %d: invalid service name '%s' "
+                              "(allowed: letters, digits, '-', '_', '.')",
+                              line_number, section_name);
+                    fclose(f);
+                    return CONFIG_ERR_SYNTAX;
+                }
+                for (int i = 0; i < ctx->service_count; i++) {
+                    if (strcmp(ctx->services[i].cfg.name, section_name) == 0) {
+                        LOG_ERROR("guardian",
+                                  "Config line %d: duplicate service name '%s'",
+                                  line_number, section_name);
+                        fclose(f);
+                        return CONFIG_ERR_SYNTAX;
+                    }
+                }
+
                 /* Any other [name] is a new service section */
                 if (ctx->service_count >= GUARDIAN_MAX_SERVICES) {
                     LOG_ERROR("guardian",
@@ -276,6 +327,7 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                 ctx->services[current_svc_idx].cfg.max_retries      = 5;
                 ctx->services[current_svc_idx].cfg.backoff_base_ms  = 1000;
                 ctx->services[current_svc_idx].cfg.backoff_max_ms   = 60000;
+                ctx->services[current_svc_idx].cfg.stable_after_s   = 60;
                 ctx->services[current_svc_idx].cfg.autostart        = 1;
             }
             continue;
@@ -390,6 +442,14 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
                     fclose(f);
                     return CONFIG_ERR_SYNTAX;
                 }
+            } else if (strcmp(key, "stable_after_s") == 0) {
+                if (!parse_int(value, &cfg->stable_after_s) || cfg->stable_after_s < 0) {
+                    LOG_ERROR("guardian",
+                              "Config line %d: invalid stable_after_s '%s'",
+                              line_number, value);
+                    fclose(f);
+                    return CONFIG_ERR_SYNTAX;
+                }
             } else if (strcmp(key, "env") == 0) {
                 /* env = KEY1=VAL1,KEY2=VAL2
                  * Split on commas and store each pair.
@@ -474,6 +534,14 @@ ConfigError config_load(const char *path, SupervisorContext *ctx) {
             LOG_ERROR("guardian", "Service '%s' has no 'command' key — required",
                       ctx->services[i].cfg.name);
             return CONFIG_ERR_NO_COMMAND;
+        }
+
+        const ServiceConfig *cfg = &ctx->services[i].cfg;
+        if (cfg->has_health_check && cfg->health.type != HEALTH_NONE &&
+            cfg->health.target[0] == '\0') {
+            LOG_ERROR("guardian", "Service '%s': [health_check] has no 'target'",
+                      cfg->name);
+            return CONFIG_ERR_SYNTAX;
         }
     }
 

@@ -10,6 +10,12 @@
  *   helper crash  — exits immediately with code 1
  *                   (simulates a service that keeps crashing)
  *
+ *   helper ignore-term — like 'run', but ignores SIGTERM (POSIX)
+ *                   (simulates a hung service that won't stop politely)
+ *
+ *   helper env NAME — prints "NAME=<value>" to stdout, then runs forever
+ *                   (lets tests check that 'env =' reaches the child)
+ *
  * Why a dedicated C binary instead of system commands (sleep, ping, false)?
  *
  *   Cross-platform:  'sleep' is not a built-in on Windows. 'ping -t' loops
@@ -50,6 +56,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -106,7 +113,28 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    fprintf(stderr, "helper: unknown command '%s' (expected: run, crash)\n",
+    if (strcmp(argv[1], "ignore-term") == 0) {
+        /* Windows has no SIGTERM to ignore — guardian's TerminateProcess
+         * always works there — so this behaves like 'run' on Windows. */
+        signal(SIGTERM, SIG_IGN);
+        while (1) {
+            sleep_ms(100);
+        }
+        return 0;  /* unreachable */
+    }
+
+    if (strcmp(argv[1], "env") == 0 && argc >= 3) {
+        const char *value = getenv(argv[2]);
+        printf("%s=%s\n", argv[2], value ? value : "(unset)");
+        fflush(stdout);
+        while (1) {
+            sleep_ms(100);
+        }
+        return 0;  /* unreachable */
+    }
+
+    fprintf(stderr, "helper: unknown command '%s' "
+                    "(expected: run, crash, ignore-term, env NAME)\n",
             argv[1]);
     return 1;
 }

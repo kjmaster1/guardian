@@ -65,11 +65,11 @@ else
         TARGET       = guardian
         TEST_EXT     =
     endif
-    ifeq ($(UNAME),Darwin)
-        PLATFORM_SRC = src/platform/platform_macos.c
-        LDFLAGS     += -lpthread
-        TARGET       = guardian
-        TEST_EXT     =
+    # Anything else (macOS, BSD, ...) has no platform layer yet. Fail with a
+    # clear message instead of the old Darwin branch, which pointed at a
+    # platform_macos.c that doesn't exist and died with "No rule to make target".
+    ifneq ($(UNAME),Linux)
+        $(error Unsupported platform '$(UNAME)': guardian builds on Linux and Windows only)
     endif
 endif
 
@@ -238,13 +238,24 @@ $(HELPER): tests/helper.c
 #   - The guardian binary must already be built ($(TARGET) dependency)
 #   - The helper binary is built here as a dependency
 #
-# The '-' prefix means: if python3 fails (not found), fall back to python.
-# This handles systems that use 'python' instead of 'python3'.
+# Choosing the interpreter:
+#   The old recipe was 'python3 tests/... || python tests/...'. But '||'
+#   cannot tell "python3 is missing" apart from "python3 ran the tests and
+#   some failed", so every test failure re-ran the WHOLE suite under
+#   'python' (and on Linux, where 'python' often doesn't exist, buried the
+#   real failure under "python: command not found").
+#
+#   Instead we decide ONCE, before running anything: use python3 if it is a
+#   working Python 3, otherwise python. The probe actually runs code, which
+#   matters on Windows: there 'python3' is often a Microsoft Store
+#   placeholder that exists on PATH but exits with an error. Override with
+#   e.g. 'make integration-test PYTHON=py'.
+PYTHON ?= $(lastword python $(shell python3 -c "import sys; sys.exit(sys.version_info[0] < 3)" >/dev/null 2>&1 && echo python3))
+
 integration-test: $(TARGET) $(HELPER)
 	@echo ""
-	@echo "  ── Integration tests ──────────────────────────────────────────"
-	python3 tests/integration_test.py ./$(TARGET) ./$(HELPER) \
-	    || python tests/integration_test.py ./$(TARGET) ./$(HELPER)
+	@echo "  ── Integration tests ($(PYTHON)) ──────────────────────────────"
+	$(PYTHON) tests/integration_test.py ./$(TARGET) ./$(HELPER)
 	@echo ""
 
 # Copy the binary to /usr/local/bin so you can run 'guardian' from anywhere.

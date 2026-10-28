@@ -20,6 +20,7 @@
 #pragma once
 
 #include <stdint.h>   /* int64_t */
+#include <stdatomic.h> /* atomic_int — the shutdown flag shared across threads */
 
 /* ==========================================================================
  * Platform-specific type aliases
@@ -41,7 +42,9 @@
     #define PLATFORM_INVALID_PID     ((PlatformPid)0)
     #define PLATFORM_INVALID_HANDLE  INVALID_HANDLE_VALUE
 #else
-    #include <unistd.h>   /* pid_t */
+    /* pid_t comes from <sys/types.h>. <unistd.h> hides it under -std=c11
+     * unless _POSIX_C_SOURCE is defined, so this header can't rely on it. */
+    #include <sys/types.h>
     typedef pid_t   PlatformPid;
     typedef int     PlatformHandle;   /* unused on POSIX, always -1 */
     #define PLATFORM_INVALID_PID     ((PlatformPid)(-1))
@@ -128,10 +131,11 @@ void platform_close_handle(PlatformHandle handle);
  * When SIGTERM or SIGINT arrives, sets *shutdown_flag = 0.
  * The main event loop checks this flag each tick to know when to stop.
  *
- * 'volatile int*' — the volatile qualifier is required here. See service.h
- * for a full explanation of why volatile is necessary for signal-touched flags.
+ * 'atomic_int*' — the flag is read by several threads and written from a
+ * signal handler. See SupervisorContext.running in service.h for why this
+ * must be atomic rather than just volatile.
  */
-void platform_install_signal_handlers(volatile int *shutdown_flag);
+void platform_install_signal_handlers(atomic_int *shutdown_flag);
 
 /*
  * platform_now_ms — current time in milliseconds

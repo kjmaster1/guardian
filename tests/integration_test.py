@@ -135,6 +135,18 @@ def service_is_in_state(status_output, service_name, state):
     return False
 
 
+def status_row(status_output, service_name):
+    """
+    Return the status table row for a service as a list of columns
+    [name, state, pid, restarts, uptime], or None if it isn't listed.
+    """
+    for line in status_output.splitlines():
+        cols = line.split()
+        if cols and cols[0] == service_name:
+            return cols
+    return None
+
+
 def wait_for_state(guardian, config, service, state, timeout_s=5):
     """
     Poll 'guardian status' every 200ms until the named service reaches
@@ -268,8 +280,8 @@ stdout_log      = {log}
         #   t~100ms   supervisor tick: process still alive → RUNNING
         #                              (or already dead → crash handling)
         #   t~200ms   process exits (code 1) → retry_count=1, BACKOFF
-        #             next_restart = now + 300*2 = 600ms from crash
-        #   t~800ms   BACKOFF delay expires → restart attempt
+        #             next_restart = now + 300ms (first delay = base)
+        #   t~500ms   BACKOFF delay expires → restart attempt
         #   ...        (loops forever because max_retries=0)
         #
         # We expect to see BACKOFF at some point within 4 seconds.
@@ -293,11 +305,11 @@ def test_max_retries_leads_to_failed(guardian, helper):
     transition permanently to FAILED.
 
     With max_retries=2 and base=200ms:
-      Crash 1 → BACKOFF(400ms) → restart
-      Crash 2 → BACKOFF(800ms) → restart
+      Crash 1 → BACKOFF(200ms) → restart
+      Crash 2 → BACKOFF(400ms) → restart
       Crash 3 → FAILED (retry_count 3 > max_retries 2)
 
-    Total expected time to FAILED: ~1.2 seconds. We allow 6 seconds.
+    Total expected time to FAILED: ~0.6 seconds. We allow 6 seconds.
 
     This validates the give-up logic in handle_exited_service().
     """
@@ -377,6 +389,15 @@ stdout_log      = {log}
             f"service left STOPPED state unexpectedly. Status:\n{status}",
         )
 
+        # Regression: on Linux the "no process" pid is -1, which used to be
+        # printed as 18446744073709551615 and shown truncated in the table.
+        TEST("stopped service reports PID 0")
+        row = status_row(status, "no-restart-svc")
+        ASSERT(
+            row is not None and row[2] == "0",
+            f"expected PID column '0', got row {row}",
+        )
+
     finally:
         if proc:
             stop_guardian(guardian, cfg, proc)
@@ -437,6 +458,229 @@ stdout_log = {log}
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_unhealthy_hung_service_is_restarted(guardian, helper):
+    """
+    A service that fails its health check AND ignores SIGTERM must still be
+    restarted: guardian escalates to SIGKILL after GUARDIAN_STOP_TIMEOUT_MS.
+
+    Regression: the runtime stop path never escalated, so a hung process sat
+    in STOPPING forever and was never restarted. (On Windows, termination is
+    always forceful, so this passes quickly there.)
+
+    The health check probes 127.0.0.1:1, where nothing listens, so every
+    probe fails. This is also the first integration test that exercises
+    the health-check subsystem end to end.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t6")
+        log  = os.path.join(tmpdir, "t6.log").replace("\\", "/")
+        cfg  = write_config(tmpdir, "t6.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[hung-svc]
+command         = {helper}
+args            = ignore-term
+max_retries     = 0
+backoff_base_ms = 200
+stdout_log      = {log}
+
+[health_check]
+type                = tcp
+target              = 127.0.0.1:1
+interval_s          = 1
+timeout_s           = 1
+unhealthy_threshold = 1
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("unhealthy service that ignores SIGTERM is killed and restarted")
+        deadline = time.time() + 15
+        restarted = False
+        row = None
+        while time.time() < deadline:
+            row = status_row(get_status(guardian, cfg), "hung-svc")
+            if row and row[3].isdigit() and int(row[3]) >= 1:
+                restarted = True
+                break
+            time.sleep(0.2)
+        ASSERT(restarted, f"service was never restarted; last status row: {row}")
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_second_instance_is_refused(guardian, helper):
+    """
+    Starting guardian twice with the same ipc_socket must fail, and the
+    first instance must remain reachable.
+
+    Regression: on Linux the second instance unlinked the first one's socket
+    and took it over, so both supervised the same services and the first
+    could no longer be stopped with 'guardian stop'.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t7")
+        log  = os.path.join(tmpdir, "t7.log").replace("\\", "/")
+        cfg  = write_config(tmpdir, "t7.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[only-once]
+command    = {helper}
+args       = run
+stdout_log = {log}
+""")
+        proc = start_guardian(guardian, cfg)
+        wait_for_state(guardian, cfg, "only-once", "RUNNING", timeout_s=5)
+
+        TEST("second guardian with the same ipc_socket exits with an error")
+        try:
+            second = subprocess.run(
+                [guardian, "start", cfg],
+                capture_output=True,
+                timeout=10,
+            )
+            refused = second.returncode != 0
+        except subprocess.TimeoutExpired:
+            refused = False  # it started supervising — the bug
+        ASSERT(refused, "second instance started instead of refusing")
+
+        TEST("first instance is still reachable after the refused start")
+        ASSERT(
+            wait_for_state(guardian, cfg, "only-once", "RUNNING", timeout_s=3),
+            "first instance no longer answers status",
+        )
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_env_vars_reach_child(guardian, helper):
+    """
+    'env = KEY=VALUE' must be visible to the managed process.
+
+    Regression: platform_windows.c ignored env_vars entirely, so this
+    setting silently did nothing on Windows.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t8")
+        log  = os.path.join(tmpdir, "t8.log").replace("\\", "/")
+        cfg  = write_config(tmpdir, "t8.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[env-svc]
+command    = {helper}
+args       = env GUARDIAN_TEST_VAR
+env        = GUARDIAN_TEST_VAR=hello-from-guardian
+stdout_log = {log}
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("env var from config is set in the child process")
+        expected = "GUARDIAN_TEST_VAR=hello-from-guardian"
+        deadline = time.time() + 5
+        content = ""
+        while time.time() < deadline:
+            if os.path.exists(log):
+                with open(log) as f:
+                    content = f.read()
+                if expected in content:
+                    break
+            time.sleep(0.2)
+        ASSERT(expected in content, f"child printed: {content.strip()!r}")
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_command_found_via_service_path(guardian, helper):
+    """
+    A bare command name is looked up in PATH, and a service's own
+    'env = PATH=...' takes part in that lookup.
+
+    guardian used to call execvp() in the child after setenv(), which gave
+    this behaviour for free. The PATH search now happens in the parent
+    (so the child only makes fork-safe calls); this test pins the behaviour.
+    Linux only: on Windows, CreateProcess searches guardian's own PATH.
+    """
+    if IS_WINDOWS:
+        return
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t9")
+        cfg  = write_config(tmpdir, "t9.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[path-svc]
+command = {os.path.basename(helper)}
+args    = run
+env     = PATH={os.path.dirname(helper)}
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("bare command name is resolved through the service's PATH")
+        ASSERT(
+            wait_for_state(guardian, cfg, "path-svc", "RUNNING", timeout_s=5),
+            "service did not start — PATH lookup failed",
+        )
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_missing_command_reaches_failed(guardian, helper):
+    """
+    A command that cannot be launched at all must give up after max_retries.
+
+    Regression: a failed launch scheduled its own restart without checking
+    max_retries, so on Windows (where CreateProcess fails up front) the
+    service retried forever and never reached FAILED.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t10")
+        cfg  = write_config(tmpdir, "t10.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[missing-svc]
+command         = guardian-no-such-command
+max_retries     = 1
+backoff_base_ms = 100
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("service whose command does not exist reaches FAILED")
+        ASSERT(
+            wait_for_state(guardian, cfg, "missing-svc", "FAILED", timeout_s=6),
+            "FAILED never appeared — spawn failures may be ignoring max_retries",
+        )
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
@@ -472,6 +716,11 @@ def main():
     test_max_retries_leads_to_failed(guardian, helper)
     test_restart_never_stays_stopped(guardian, helper)
     test_stop_command_exits_cleanly(guardian, helper)
+    test_unhealthy_hung_service_is_restarted(guardian, helper)
+    test_second_instance_is_refused(guardian, helper)
+    test_env_vars_reach_child(guardian, helper)
+    test_command_found_via_service_path(guardian, helper)
+    test_missing_command_reaches_failed(guardian, helper)
 
     ok = SUMMARY()
     sys.exit(0 if ok else 1)

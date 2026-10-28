@@ -76,6 +76,79 @@ int64_t service_compute_backoff_ms(const ServiceConfig *cfg, int retry_count) {
 }
 
 /* ==========================================================================
+ * service_schedule_restart — the single place restart attempts are counted
+ *
+ * Before this existed, the crash path checked max_retries but the
+ * health-failure and spawn-failure paths did their own retry_count++ and went
+ * straight to BACKOFF. A service that kept failing its health check (or whose
+ * executable could not be spawned) restarted forever, ignoring max_retries.
+ * Duplicated logic drifts apart; one shared function cannot.
+ * ==========================================================================
+ */
+
+int service_schedule_restart(Service *svc) {
+    /* max_retries == 0 means unlimited — we never give up. */
+    svc->rt.retry_count++;
+    svc->rt.total_restarts++;
+
+    if (svc->cfg.max_retries > 0 &&
+        svc->rt.retry_count > svc->cfg.max_retries) {
+        LOG_ERROR(svc->cfg.name,
+                  "Giving up after %d restart attempts (max_retries = %d)",
+                  svc->rt.retry_count - 1, svc->cfg.max_retries);
+        svc->rt.state = STATE_FAILED;
+        return 0;
+    }
+
+    /*
+     * Go to BACKOFF. The event loop will check next_restart_ms each tick
+     * and call service_start() when the delay has elapsed.
+     *
+     * retry_count was just incremented, so attempt n uses exponent n - 1:
+     * the first restart waits backoff_base_ms, matching the docs' table
+     * (1s, 2s, 4s, ...). Passing retry_count itself doubled every delay.
+     */
+    svc->rt.next_restart_ms = service_compute_backoff_ms(&svc->cfg,
+                                                          svc->rt.retry_count - 1);
+    svc->rt.state = STATE_BACKOFF;
+
+    int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();
+    LOG_INFO(svc->cfg.name,
+             "Will restart in %.1fs (attempt %d%s)",
+             (double)delay_ms / 1000.0,
+             svc->rt.retry_count,
+             svc->cfg.max_retries > 0 ? "" : ", unlimited retries");
+    return 1;
+}
+
+/* ==========================================================================
+ * service_reset_retries_if_stable
+ *
+ * Without this, retry_count only ever grew. max_retries = 5 then meant
+ * "five crashes in the service's whole lifetime", so a service that crashed
+ * once a day ended up FAILED after five days of otherwise healthy running.
+ * What max_retries is really meant to catch is a crash LOOP — a service
+ * that dies again soon after every restart. A long stable run proves the
+ * loop is over, so the budget (and the backoff delay) starts fresh.
+ * ==========================================================================
+ */
+
+int service_reset_retries_if_stable(Service *svc, int64_t now_ms) {
+    if (svc->rt.state != STATE_RUNNING) return 0;
+    if (svc->rt.retry_count == 0)       return 0;  /* nothing to forgive */
+    if (svc->cfg.stable_after_s <= 0)   return 0;  /* reset disabled */
+
+    int64_t up_ms = now_ms - svc->rt.started_at_ms;
+    if (up_ms < (int64_t)svc->cfg.stable_after_s * 1000) return 0;
+
+    LOG_INFO(svc->cfg.name,
+             "Stable for %ds — restart budget reset (had used %d)",
+             svc->cfg.stable_after_s, svc->rt.retry_count);
+    svc->rt.retry_count = 0;
+    return 1;
+}
+
+/* ==========================================================================
  * service_start — spawn the process for one service
  * ==========================================================================
  */
@@ -132,11 +205,10 @@ int service_start(SupervisorContext *ctx, int index) {
          * go to BACKOFF so guardian will try again after a delay.
          * Don't give up immediately on a spawn failure; the executable
          * might not exist YET (e.g., built by another process).
+         * max_retries still applies, so a permanently missing executable
+         * ends in FAILED instead of retrying forever.
          */
-        svc->rt.state             = STATE_BACKOFF;
-        svc->rt.retry_count++;
-        svc->rt.next_restart_ms   = service_compute_backoff_ms(&svc->cfg,
-                                                                svc->rt.retry_count);
+        service_schedule_restart(svc);
         return 0;
     }
 
@@ -153,6 +225,11 @@ int service_start(SupervisorContext *ctx, int index) {
     svc->rt.process_handle = spawn.handle;
     svc->rt.state          = STATE_STARTING;
     svc->rt.started_at_ms  = platform_now_ms();
+
+    /* A fresh process starts with a clean health record. Otherwise failures
+     * counted against the previous process would carry over, and the new one
+     * could be killed by its very first failed probe. */
+    svc->rt.consecutive_failures = 0;
 
     LOG_INFO(svc->cfg.name, "Started with PID %lu",
              (unsigned long)spawn.pid);
@@ -175,7 +252,8 @@ void service_stop(SupervisorContext *ctx, int index) {
     LOG_INFO(svc->cfg.name, "Stopping (PID %lu)", (unsigned long)svc->rt.pid);
 
     platform_terminate(svc->rt.pid, svc->rt.process_handle);
-    svc->rt.state = STATE_STOPPING;
+    svc->rt.state             = STATE_STOPPING;
+    svc->rt.stop_requested_ms = platform_now_ms();
 
     /*
      * We don't wait here for the process to actually exit.

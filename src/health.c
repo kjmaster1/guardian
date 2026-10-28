@@ -315,8 +315,21 @@ static int check_command(const HealthCheckConfig *hc) {
         platform_sleep_ms(100);
     }
 
-    /* Timed out — kill it and report unhealthy */
+    /*
+     * Timed out — kill it and report unhealthy.
+     *
+     * Killing is not enough on POSIX: a dead child stays in the process
+     * table as a zombie until its parent collects the exit status with
+     * waitpid(). platform_check_process() is what calls waitpid(), so we
+     * keep calling it until the kill lands. Without this, every timed-out
+     * probe leaked one zombie for the lifetime of guardian. SIGKILL takes
+     * effect almost immediately; the 1s bound is only a safety net.
+     */
     platform_kill(r.pid, r.handle);
+    for (int i = 0; i < 100; i++) {
+        if (platform_check_process(r.pid, r.handle).exited) break;
+        platform_sleep_ms(10);
+    }
     platform_close_handle(r.handle);
     return 0;
 }

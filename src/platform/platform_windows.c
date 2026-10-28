@@ -17,6 +17,11 @@
  * Without it, windows.h pulls in winsock.h which conflicts with winsock2.h.
  * Always define this before including windows.h. */
 #define WIN32_LEAN_AND_MEAN
+/* SRWLOCK (used below) needs Windows Vista or later. Older MinGW toolchains
+ * default to targeting XP, so say so explicitly. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <windows.h>      /* All Win32 API — CreateProcess, Job Objects, etc. */
 #include <winsock2.h>     /* Windows Sockets 2 — TCP/IP networking */
 #include <ws2tcpip.h>     /* getaddrinfo, inet_pton and other modern socket helpers */
@@ -26,6 +31,19 @@
 #include <stdio.h>     /* fprintf, stderr, snprintf */
 #include <string.h>    /* memset, strncpy, strlen   */
 #include <stdlib.h>    /* malloc, free               */
+#include <ctype.h>     /* toupper                    */
+
+/*
+ * g_table_lock — protects the lazily-created globals in this file
+ *
+ * Health check threads call platform_tcp_connect() and platform_spawn()
+ * concurrently with each other and with the main thread. The socket table,
+ * the Job Object and WSAStartup are all created/updated on first use, so
+ * without a lock two threads could claim the same socket-table slot (one
+ * socket leaks, and the other thread later closes the wrong one).
+ * SRWLOCK_INIT means the lock needs no runtime initialization.
+ */
+static SRWLOCK g_table_lock = SRWLOCK_INIT;
 
 /* ==========================================================================
  * Argument string helpers
@@ -88,8 +106,8 @@ static HANDLE g_job_object = NULL;
 /*
  * ensure_job_object — create the Job Object if it doesn't exist yet
  *
- * Called lazily on first spawn. Thread-safe? Not yet — Phase 5 adds locking.
- * For Phase 2, spawning happens only from the main thread.
+ * Called lazily on first spawn. Health threads spawn 'command' probes, so
+ * the caller must hold g_table_lock.
  */
 static void ensure_job_object(void) {
     if (g_job_object != NULL) return;
@@ -132,6 +150,76 @@ static void ensure_job_object(void) {
 }
 
 /* ==========================================================================
+ * Environment block for CreateProcess
+ *
+ * On Linux the child calls setenv() between fork() and exec(). Windows has
+ * no fork, so instead we hand CreateProcess a complete environment:
+ *   "KEY=VALUE\0KEY2=VALUE2\0...\0\0"
+ * built from guardian's own environment plus the service's env vars.
+ * (This used to be skipped entirely — 'env =' was silently ignored on
+ * Windows even though the docs say it works.)
+ * ==========================================================================
+ */
+
+/* Does the inherited entry "NAME=..." have the same NAME as any override?
+ * Windows variable names are case-insensitive. Entries such as "=C:=C:\x"
+ * (hidden per-drive directories) start with '=', so the name search
+ * begins at the second character. */
+static int env_is_overridden(const char *entry, const char **env_vars, int env_count) {
+    const char *eq = strchr(entry + 1, '=');
+    size_t name_len = eq ? (size_t)(eq - entry) : strlen(entry);
+
+    for (int i = 0; i < env_count; i++) {
+        const char *ov = env_vars[i];
+        if (strlen(ov) <= name_len || ov[name_len] != '=') continue;
+        size_t j = 0;
+        while (j < name_len &&
+               toupper((unsigned char)ov[j]) == toupper((unsigned char)entry[j])) {
+            j++;
+        }
+        if (j == name_len) return 1;
+    }
+    return 0;
+}
+
+/* Returns a malloc'd environment block (caller frees), or NULL on failure. */
+static char *build_env_block(const char **env_vars, int env_count) {
+    char *parent = GetEnvironmentStringsA();
+    if (parent == NULL) return NULL;
+
+    /* Pass 1: measure. Each entry is a NUL-terminated string; the block
+     * ends with an empty string (a second NUL). */
+    size_t total = 1;
+    for (const char *p = parent; *p; p += strlen(p) + 1) total += strlen(p) + 1;
+    for (int i = 0; i < env_count; i++) total += strlen(env_vars[i]) + 1;
+
+    char *block = malloc(total);
+    if (block == NULL) {
+        FreeEnvironmentStringsA(parent);
+        return NULL;
+    }
+
+    /* Pass 2: copy inherited entries that aren't overridden, then ours. */
+    char *out = block;
+    for (const char *p = parent; *p; p += strlen(p) + 1) {
+        if (env_is_overridden(p, env_vars, env_count)) continue;
+        size_t n = strlen(p) + 1;
+        memcpy(out, p, n);
+        out += n;
+    }
+    for (int i = 0; i < env_count; i++) {
+        if (strchr(env_vars[i], '=') == NULL) continue;  /* not KEY=VALUE */
+        size_t n = strlen(env_vars[i]) + 1;
+        memcpy(out, env_vars[i], n);
+        out += n;
+    }
+    *out = '\0';
+
+    FreeEnvironmentStringsA(parent);
+    return block;
+}
+
+/* ==========================================================================
  * platform_spawn — launch a child process
  *
  * This is the Windows equivalent of fork() + exec().
@@ -150,10 +238,9 @@ SpawnResult platform_spawn(const char  *command,
     result.pid    = PLATFORM_INVALID_PID;
     result.handle = PLATFORM_INVALID_HANDLE;
 
-    /* Suppress unused warning — env vars support comes in a later step */
-    (void)env_vars; (void)env_count;
-
+    AcquireSRWLockExclusive(&g_table_lock);
     ensure_job_object();
+    ReleaseSRWLockExclusive(&g_table_lock);
 
     /* ----------------------------------------------------------------
      * Step 1: Build the command-line string.
@@ -281,7 +368,7 @@ SpawnResult platform_spawn(const char  *command,
      *   bInheritHandles:      TRUE — child inherits our open handles (the log files)
      *   dwCreationFlags:      CREATE_NO_WINDOW — don't open a console window
      *                         for background services
-     *   lpEnvironment:        NULL — inherit guardian's environment for now
+     *   lpEnvironment:        our env block, or NULL to inherit guardian's
      *   lpCurrentDirectory:   working_dir, or NULL to inherit guardian's cwd
      *   lpStartupInfo:        our STARTUPINFOA struct
      *   lpProcessInformation: Windows fills this with the new process's info
@@ -294,6 +381,18 @@ SpawnResult platform_spawn(const char  *command,
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
 
+    char *env_block = NULL;
+    if (env_vars && env_count > 0) {
+        env_block = build_env_block(env_vars, env_count);
+        if (env_block == NULL) {
+            if (h_stdout != INVALID_HANDLE_VALUE) CloseHandle(h_stdout);
+            if (h_stderr != INVALID_HANDLE_VALUE) CloseHandle(h_stderr);
+            snprintf(result.error_msg, sizeof(result.error_msg),
+                     "failed to build environment block");
+            return result;
+        }
+    }
+
     BOOL ok = CreateProcessA(
         NULL,
         cmd_line,
@@ -301,11 +400,13 @@ SpawnResult platform_spawn(const char  *command,
         NULL,
         TRUE,                /* bInheritHandles — must be TRUE for log redirection */
         CREATE_NO_WINDOW,
-        NULL,
+        env_block,
         (working_dir && working_dir[0]) ? working_dir : NULL,
         &si,
         &pi
     );
+    DWORD create_err = ok ? 0 : GetLastError();  /* before free() can change it */
+    free(env_block);
 
     /* Close the log file handles in the PARENT — we don't need them here.
      * The child has its own copies (inherited). If we don't close ours,
@@ -316,7 +417,7 @@ SpawnResult platform_spawn(const char  *command,
     if (!ok) {
         snprintf(result.error_msg, sizeof(result.error_msg),
                  "CreateProcess failed for '%s' (error %lu)",
-                 command, GetLastError());
+                 command, create_err);
         return result;
     }
 
@@ -430,13 +531,13 @@ void platform_close_handle(PlatformHandle handle) {
  * reach it. This is safe because there is only ever one supervisor instance.
  * ==========================================================================
  */
-static volatile int *g_shutdown_flag = NULL;
+static atomic_int *g_shutdown_flag = NULL;
 
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     /*
      * This function is called by Windows on a SEPARATE THREAD when a
-     * control event arrives. That's why the shutdown flag must be volatile —
-     * the main thread reads it, this thread writes it.
+     * control event arrives. That's why the shutdown flag must be atomic —
+     * this thread writes it while the main and health threads read it.
      *
      * We handle all event types the same way: set the flag and return TRUE.
      * Returning TRUE tells Windows "we handled it — don't terminate the process."
@@ -457,7 +558,7 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     }
 }
 
-void platform_install_signal_handlers(volatile int *shutdown_flag) {
+void platform_install_signal_handlers(atomic_int *shutdown_flag) {
     g_shutdown_flag = shutdown_flag;
     /*
      * SetConsoleCtrlHandler(handler, add)
@@ -745,10 +846,23 @@ int platform_ipc_recv(int fd, char *buf, int len) {
     if (h == INVALID_HANDLE_VALUE) return -1;
 
     if (g_ipc_is_server[fd]) {
-        /* Non-blocking path: check without committing to a read */
+        /*
+         * Non-blocking path: check without committing to a read.
+         *
+         * The client connects first and writes its command a moment later,
+         * and we accept on a 100ms tick — so we can arrive between the two.
+         * Hanging up then made 'guardian status' fail at random. Wait up to
+         * 1s for the command (the Linux side gets the same effect from a
+         * blocking recv with SO_RCVTIMEO). PeekNamedPipe fails as soon as
+         * the client disconnects, so a client that leaves costs nothing.
+         */
         DWORD available = 0;
-        if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL)) return -1;
-        if (available == 0) return 0;  /* nothing to read yet */
+        for (int waited_ms = 0; ; waited_ms += 10) {
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL)) return -1;
+            if (available > 0) break;
+            if (waited_ms >= 1000) return 0;  /* client never sent anything */
+            Sleep(10);
+        }
     }
     /* else: client fd in blocking mode — fall straight through to ReadFile */
 
@@ -800,12 +914,15 @@ void platform_ipc_close(int fd) {
  * We use a small lookup table (g_sock_table) to map between our int fd
  * abstraction and the real Windows SOCKET values.
  *
- * The table uses indices 100..115 to avoid collision with the IPC table
- * (which uses indices 0..15).
+ * The table uses indices 100..163 to avoid collision with the IPC table
+ * (which uses indices 0..15). 64 slots = one per possible health thread
+ * (GUARDIAN_MAX_SERVICES), so concurrent probes can't exhaust it.
+ *
+ * All access goes through g_table_lock: health threads connect concurrently.
  * ==========================================================================
  */
 
-#define MAX_SOCK_FDS   16
+#define MAX_SOCK_FDS   64
 #define SOCK_FD_OFFSET 100  /* our TCP fds start at 100 to separate from IPC fds */
 
 static SOCKET g_sock_table[MAX_SOCK_FDS];
@@ -818,25 +935,35 @@ static void sock_table_init_once(void) {
 }
 
 static int sock_table_alloc(SOCKET s) {
+    int fd = -1;
+    AcquireSRWLockExclusive(&g_table_lock);
     sock_table_init_once();
     for (int i = 0; i < MAX_SOCK_FDS; i++) {
         if (g_sock_table[i] == INVALID_SOCKET) {
             g_sock_table[i] = s;
-            return i + SOCK_FD_OFFSET;
+            fd = i + SOCK_FD_OFFSET;
+            break;
         }
     }
-    return -1;  /* table full */
+    ReleaseSRWLockExclusive(&g_table_lock);
+    return fd;  /* -1 = table full */
 }
 
 static SOCKET sock_table_get(int fd) {
     int i = fd - SOCK_FD_OFFSET;
     if (i < 0 || i >= MAX_SOCK_FDS) return INVALID_SOCKET;
-    return g_sock_table[i];
+    AcquireSRWLockExclusive(&g_table_lock);
+    SOCKET s = g_sock_table_init ? g_sock_table[i] : INVALID_SOCKET;
+    ReleaseSRWLockExclusive(&g_table_lock);
+    return s;
 }
 
 static void sock_table_free(int fd) {
     int i = fd - SOCK_FD_OFFSET;
-    if (i >= 0 && i < MAX_SOCK_FDS) g_sock_table[i] = INVALID_SOCKET;
+    if (i < 0 || i >= MAX_SOCK_FDS) return;
+    AcquireSRWLockExclusive(&g_table_lock);
+    g_sock_table[i] = INVALID_SOCKET;
+    ReleaseSRWLockExclusive(&g_table_lock);
 }
 
 /*
@@ -852,10 +979,13 @@ static void sock_table_free(int fd) {
  */
 static int g_wsa_init = 0;
 static void ensure_wsa(void) {
-    if (g_wsa_init) return;
-    WSADATA wd;
-    WSAStartup(MAKEWORD(2, 2), &wd);
-    g_wsa_init = 1;
+    AcquireSRWLockExclusive(&g_table_lock);
+    if (!g_wsa_init) {
+        WSADATA wd;
+        WSAStartup(MAKEWORD(2, 2), &wd);
+        g_wsa_init = 1;
+    }
+    ReleaseSRWLockExclusive(&g_table_lock);
 }
 
 /*
@@ -958,7 +1088,9 @@ int platform_tcp_connect(const char *host, int port, int timeout_ms) {
     DWORD recv_timeout = (DWORD)timeout_ms;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&recv_timeout, sizeof(recv_timeout));
 
-    return sock_table_alloc(s);
+    int fd = sock_table_alloc(s);
+    if (fd < 0) closesocket(s);  /* table full — don't leak the socket */
+    return fd;
 }
 
 int platform_tcp_send(int fd, const char *buf, int len) {

@@ -205,6 +205,146 @@ static void test_backoff_small_base(void) {
 }
 
 /* ==========================================================================
+ * service_schedule_restart() tests
+ *
+ * Regression: crash restarts checked max_retries, but restarts caused by
+ * health-check failures and spawn failures did not — those services could
+ * restart forever even with max_retries = 2. All three paths now share
+ * service_schedule_restart(), so testing it covers all of them.
+ * ==========================================================================
+ */
+
+static Service make_svc(int max_retries) {
+    Service svc;
+    memset(&svc, 0, sizeof(svc));
+    svc.cfg.max_retries     = max_retries;
+    svc.cfg.backoff_base_ms = 1000;
+    svc.cfg.backoff_max_ms  = 60000;
+    return svc;
+}
+
+static void test_schedule_restart_enters_backoff(void) {
+    TEST("schedule_restart under max_retries enters BACKOFF with a future restart time");
+    Service svc = make_svc(2);
+
+    int64_t before = platform_now_ms();
+    int scheduled  = service_schedule_restart(&svc);
+
+    ASSERT_INT_EQ(1, scheduled);
+    ASSERT_INT_EQ((int)STATE_BACKOFF, (int)svc.rt.state);
+    ASSERT_INT_EQ(1, svc.rt.retry_count);
+    ASSERT(svc.rt.next_restart_ms > before);
+}
+
+/*
+ * Regression: retry_count is incremented before the delay is computed, so
+ * the first restart used to wait base * 2^1 — double the documented
+ * "initial restart delay" (docs/config_reference.md backoff table).
+ */
+static void test_schedule_restart_first_delay_is_base(void) {
+    TEST("first scheduled restart waits exactly backoff_base_ms");
+    Service svc = make_svc(5);
+
+    int64_t before = platform_now_ms();
+    service_schedule_restart(&svc);
+    int64_t after  = platform_now_ms();
+
+    ASSERT_IN_RANGE(svc.rt.next_restart_ms, before + 1000, after + 1000);
+
+    TEST("second scheduled restart waits 2 * backoff_base_ms");
+    before = platform_now_ms();
+    service_schedule_restart(&svc);
+    after  = platform_now_ms();
+
+    ASSERT_IN_RANGE(svc.rt.next_restart_ms, before + 2000, after + 2000);
+}
+
+static void test_schedule_restart_gives_up_after_max(void) {
+    TEST("schedule_restart past max_retries enters FAILED");
+    Service svc = make_svc(2);
+
+    service_schedule_restart(&svc);              /* attempt 1 */
+    service_schedule_restart(&svc);              /* attempt 2 */
+    int scheduled = service_schedule_restart(&svc);  /* attempt 3 > max */
+
+    ASSERT_INT_EQ(0, scheduled);
+    ASSERT_INT_EQ((int)STATE_FAILED, (int)svc.rt.state);
+}
+
+/* ==========================================================================
+ * service_reset_retries_if_stable() tests
+ *
+ * retry_count is the restart *budget* that max_retries limits. Without a
+ * reset it only ever grew, so a service that crashed once a day reached
+ * FAILED after max_retries days. Once a service has stayed up for
+ * stable_after_s, its earlier crashes are forgiven.
+ * ==========================================================================
+ */
+
+/* A service that (re)started 'up_for_ms' ago after 3 restarts. */
+static Service make_running_svc(int stable_after_s, int64_t up_for_ms,
+                                int64_t *now_out) {
+    Service svc = make_svc(5);
+    svc.cfg.stable_after_s = stable_after_s;
+    svc.rt.state           = STATE_RUNNING;
+    svc.rt.retry_count     = 3;
+    svc.rt.total_restarts  = 3;
+    *now_out               = platform_now_ms();
+    svc.rt.started_at_ms   = *now_out - up_for_ms;
+    return svc;
+}
+
+static void test_retries_reset_after_stable_uptime(void) {
+    TEST("retry budget resets once RUNNING for stable_after_s");
+    int64_t now;
+    Service svc = make_running_svc(60, 60000, &now);
+
+    ASSERT_INT_EQ(1, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(0, svc.rt.retry_count);
+
+    TEST("lifetime restart count survives the reset");
+    ASSERT_INT_EQ(3, svc.rt.total_restarts);
+}
+
+static void test_retries_kept_before_stable_uptime(void) {
+    TEST("retry budget is kept while uptime < stable_after_s");
+    int64_t now;
+    Service svc = make_running_svc(60, 59000, &now);
+
+    ASSERT_INT_EQ(0, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(3, svc.rt.retry_count);
+}
+
+static void test_retries_never_reset_when_disabled(void) {
+    TEST("stable_after_s = 0 disables the reset");
+    int64_t now;
+    Service svc = make_running_svc(0, 3600000, &now);
+
+    ASSERT_INT_EQ(0, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(3, svc.rt.retry_count);
+}
+
+static void test_retries_not_reset_unless_running(void) {
+    TEST("retry budget is not reset for a service in BACKOFF");
+    int64_t now;
+    Service svc = make_running_svc(60, 3600000, &now);
+    svc.rt.state = STATE_BACKOFF;
+
+    ASSERT_INT_EQ(0, service_reset_retries_if_stable(&svc, now));
+    ASSERT_INT_EQ(3, svc.rt.retry_count);
+}
+
+static void test_schedule_restart_unlimited(void) {
+    TEST("schedule_restart with max_retries = 0 never gives up");
+    Service svc = make_svc(0);
+
+    for (int i = 0; i < 100; i++) service_schedule_restart(&svc);
+
+    ASSERT_INT_EQ((int)STATE_BACKOFF, (int)svc.rt.state);
+    ASSERT_INT_EQ(100, svc.rt.retry_count);
+}
+
+/* ==========================================================================
  * Test runner
  * ==========================================================================
  */
@@ -231,6 +371,18 @@ int main(void) {
     test_backoff_cap_hit_at_exact_doubling();
     test_backoff_max_equals_base();
     test_backoff_small_base();
+
+    /* service_schedule_restart */
+    test_schedule_restart_enters_backoff();
+    test_schedule_restart_first_delay_is_base();
+    test_schedule_restart_gives_up_after_max();
+    test_schedule_restart_unlimited();
+
+    /* service_reset_retries_if_stable */
+    test_retries_reset_after_stable_uptime();
+    test_retries_kept_before_stable_uptime();
+    test_retries_never_reset_when_disabled();
+    test_retries_not_reset_unless_running();
 
     SUMMARY();
     return g_tests_failed > 0 ? EXIT_FAILURE : EXIT_SUCCESS;

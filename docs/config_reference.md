@@ -28,6 +28,9 @@ section entirely and rely on defaults.
 Defines one managed process. The section name is the service's display name in
 logs and `guardian status` output. You may define up to 64 services.
 
+Service names must be unique and may contain only letters, digits, `-`, `_`
+and `.`. Any other character (spaces, quotes, ...) is a config error.
+
 ### Required
 
 | Key | Type | Description |
@@ -50,9 +53,16 @@ logs and `guardian status` output. You may define up to 64 services.
 |---|---|---|---|
 | `autostart` | bool | `true` | Start automatically when guardian launches |
 | `restart` | enum | `on_failure` | When to restart: `never`, `on_failure`, `always` |
-| `max_retries` | int | `5` | Max restart attempts; `0` = unlimited |
+| `max_retries` | int | `5` | Max restart attempts (crashes, health-check restarts and failed launches all count); `0` = unlimited |
 | `backoff_base_ms` | int (ms) | `1000` | Initial restart delay |
 | `backoff_max_ms` | int (ms) | `60000` | Maximum restart delay |
+| `stable_after_s` | int (s) | `60` | After this long in `RUNNING`, earlier restarts are forgiven: the `max_retries` budget and the backoff delay start over. `0` = never reset |
+
+`max_retries` is meant to catch a crash *loop*. With the default
+`stable_after_s = 60`, a service that crashes once a day never runs out of
+retries, while one that dies within a minute of every restart still ends up
+`FAILED`. The `RESTARTS` column of `guardian status` is a lifetime count and is
+not reset.
 
 ### Restart policies
 
@@ -90,10 +100,14 @@ to that service. Each service may have at most one health check.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `type` | enum | — | `tcp`, `http`, or `command` |
-| `target` | string | — | What to probe (format depends on type) |
+| `target` | string | — | What to probe (format depends on type). Required |
 | `interval_s` | int (s) | `10` | Seconds between probes |
 | `timeout_s` | int (s) | `3` | Seconds before a probe is considered failed |
 | `unhealthy_threshold` | int | `3` | Consecutive failures before triggering a restart |
+
+Only probes taken while the service is `RUNNING` count towards the threshold.
+When the threshold is reached guardian asks the process to stop; if it is still
+alive 5 seconds later it is force-killed, then restarted with the normal backoff.
 
 ### Type: tcp
 

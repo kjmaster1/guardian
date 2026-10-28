@@ -59,22 +59,12 @@ static void handle_exited_service(SupervisorContext *ctx, int index,
         if (svc->rt.health_triggered_stop) {
             /*
              * This stop was triggered by repeated health check failures,
-             * not by a user 'stop' command. We want to restart it —
-             * go to BACKOFF so the event loop will re-launch it after a delay.
-             *
-             * We increment retry_count so backoff delays accumulate if the
-             * service keeps failing its health check on each restart.
+             * not by a user 'stop' command. We want to restart it, subject
+             * to the same max_retries limit as a crash.
              */
             svc->rt.health_triggered_stop = 0;
-            svc->rt.retry_count++;
-            svc->rt.next_restart_ms = service_compute_backoff_ms(
-                &svc->cfg, svc->rt.retry_count);
-            svc->rt.state = STATE_BACKOFF;
-
-            int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();
-            LOG_INFO(svc->cfg.name,
-                     "Stopped after health failure — will restart in %.1fs",
-                     (double)delay_ms / 1000.0);
+            LOG_INFO(svc->cfg.name, "Stopped after health failure");
+            service_schedule_restart(svc);
         } else {
             /* Normal intentional stop */
             LOG_INFO(svc->cfg.name, "Stopped (exit code %d)", status.exit_code);
@@ -108,35 +98,8 @@ static void handle_exited_service(SupervisorContext *ctx, int index,
         return;
     }
 
-    /*
-     * Check if we've exceeded max_retries.
-     * max_retries == 0 means unlimited — we never give up.
-     */
-    svc->rt.retry_count++;
-
-    if (svc->cfg.max_retries > 0 &&
-        svc->rt.retry_count > svc->cfg.max_retries) {
-        LOG_ERROR(svc->cfg.name,
-                  "Giving up after %d restart attempts (max_retries = %d)",
-                  svc->rt.retry_count - 1, svc->cfg.max_retries);
-        svc->rt.state = STATE_FAILED;
-        return;
-    }
-
-    /*
-     * Go to BACKOFF. The event loop will check next_restart_ms each tick
-     * and call service_start() when the delay has elapsed.
-     */
-    svc->rt.next_restart_ms = service_compute_backoff_ms(&svc->cfg,
-                                                          svc->rt.retry_count);
-    svc->rt.state = STATE_BACKOFF;
-
-    int64_t delay_ms = svc->rt.next_restart_ms - platform_now_ms();
-    LOG_INFO(svc->cfg.name,
-             "Will restart in %.1fs (attempt %d%s)",
-             (double)delay_ms / 1000.0,
-             svc->rt.retry_count,
-             svc->cfg.max_retries > 0 ? "" : ", unlimited retries");
+    /* BACKOFF, or FAILED once max_retries is exhausted */
+    service_schedule_restart(svc);
 }
 
 /* ==========================================================================
@@ -153,8 +116,12 @@ static void handle_exited_service(SupervisorContext *ctx, int index,
  *   - unhealthy: increment counter; if it reaches the threshold, stop and
  *                restart the service (via health_triggered_stop flag)
  *
- * We only act on services in STATE_RUNNING — there's no point restarting
- * a service that's already stopping, in backoff, or stopped.
+ * We only count results for services in STATE_RUNNING. The health thread
+ * keeps probing while a service is in BACKOFF or STOPPING, and those probes
+ * naturally fail (nothing is listening). Counting them used to pile up
+ * failures during the backoff delay, so the restarted process was killed
+ * again by its first failed probe — a restart loop the threshold was meant
+ * to prevent.
  */
 static void drain_health_queue(SupervisorContext *ctx) {
     HealthResult hr;
@@ -163,6 +130,8 @@ static void drain_health_queue(SupervisorContext *ctx) {
         for (int i = 0; i < ctx->service_count; i++) {
             Service *svc = &ctx->services[i];
             if (strcmp(svc->cfg.name, hr.service_name) != 0) continue;
+
+            if (svc->rt.state != STATE_RUNNING) break;
 
             if (hr.healthy) {
                 if (svc->rt.consecutive_failures > 0) {
@@ -179,8 +148,7 @@ static void drain_health_queue(SupervisorContext *ctx) {
                          "Health check failed (%d/%d)",
                          svc->rt.consecutive_failures, threshold);
 
-                if (svc->rt.state == STATE_RUNNING &&
-                    svc->rt.consecutive_failures >= threshold) {
+                if (svc->rt.consecutive_failures >= threshold) {
                     LOG_WARN(svc->cfg.name,
                              "Unhealthy threshold reached — stopping for restart");
                     svc->rt.consecutive_failures   = 0;
@@ -219,6 +187,21 @@ static void supervisor_tick(SupervisorContext *ctx) {
 
                 if (status.exited) {
                     handle_exited_service(ctx, i, status);
+                } else if (svc->rt.state == STATE_STOPPING &&
+                           now - svc->rt.stop_requested_ms >= GUARDIAN_STOP_TIMEOUT_MS) {
+                    /*
+                     * We asked it to stop and it ignored us. Health checks
+                     * exist precisely for hung processes, and a hung process
+                     * often never gets round to handling SIGTERM. Without
+                     * this escalation it stayed in STOPPING forever and was
+                     * never restarted. SIGKILL cannot be ignored; the next
+                     * tick reaps it and handle_exited_service() takes over.
+                     */
+                    LOG_WARN(svc->cfg.name,
+                             "Did not stop within %ds — force killing",
+                             GUARDIAN_STOP_TIMEOUT_MS / 1000);
+                    platform_kill(svc->rt.pid, svc->rt.process_handle);
+                    svc->rt.stop_requested_ms = now;  /* don't re-kill every tick */
                 } else if (svc->rt.state == STATE_STARTING) {
                     /*
                      * Still alive and in STARTING state.
@@ -228,6 +211,9 @@ static void supervisor_tick(SupervisorContext *ctx) {
                     svc->rt.state = STATE_RUNNING;
                     LOG_INFO(svc->cfg.name, "Running (PID %lu)",
                              (unsigned long)svc->rt.pid);
+                } else {
+                    /* Up long enough to forgive earlier crashes? */
+                    service_reset_retries_if_stable(svc, now);
                 }
                 break;
             }
@@ -291,13 +277,13 @@ static void supervisor_stop_all(SupervisorContext *ctx) {
     }
 
     /*
-     * Second pass: wait up to 5 seconds for each service to exit.
+     * Second pass: wait up to GUARDIAN_STOP_TIMEOUT_MS for services to exit.
      *
      * We poll in 100ms increments. This is a simple approach — a production
      * implementation would use WaitForMultipleObjects (Windows) or poll/select
      * (Linux) to wait on all processes simultaneously rather than sequentially.
      */
-    int max_wait_ms = 5000;
+    int max_wait_ms = GUARDIAN_STOP_TIMEOUT_MS;
     int waited_ms   = 0;
 
     while (waited_ms < max_wait_ms) {
@@ -332,10 +318,13 @@ static void supervisor_stop_all(SupervisorContext *ctx) {
         Service *svc = &ctx->services[i];
         if (svc->rt.state == STATE_STOPPING) {
             LOG_WARN(svc->cfg.name,
-                     "Did not stop within 5s — force killing");
+                     "Did not stop within %ds — force killing",
+                     GUARDIAN_STOP_TIMEOUT_MS / 1000);
             platform_kill(svc->rt.pid, svc->rt.process_handle);
             platform_close_handle(svc->rt.process_handle);
-            svc->rt.state = STATE_STOPPED;
+            svc->rt.process_handle = PLATFORM_INVALID_HANDLE;
+            svc->rt.state          = STATE_STOPPED;
+            svc->rt.pid            = PLATFORM_INVALID_PID;
         }
     }
 }
