@@ -217,22 +217,9 @@ int ipc_send_command(const char *ipc_path,
      * 3. Read the response
      * 4. Close
      *
-     * On failure (daemon not running), we get -1 back from platform_ipc_accept
-     * and report a helpful error.
-     *
-     * We reuse the IPC fd interface here. platform_ipc_listen opens a SERVER.
-     * For the client we need a different function — platform_ipc_connect.
-     * Rather than add another platform function, we use a small trick:
-     * platform_ipc_accept is overloaded to work as platform_ipc_connect
-     * when passed the special value -1 along with the path embedded in
-     * the server_fd... actually, let's just add the client function properly.
-     *
-     * For now: platform_ipc_accept(-1) is used as a client connect signal.
-     * The platform implementation handles this distinction.
-     * See platform_windows.c for the implementation detail.
+     * On failure (daemon not running), platform_ipc_connect returns -1
+     * and we report a helpful error.
      */
-
-    /* Use a special sentinel fd (-2) to signal "I am a client, connect to path" */
     int fd = platform_ipc_connect(ipc_path);
     if (fd < 0) {
         fprintf(stderr, "guardian: cannot connect to daemon at '%s'\n"
