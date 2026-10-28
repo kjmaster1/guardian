@@ -458,6 +458,60 @@ stdout_log = {log}
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_unhealthy_hung_service_is_restarted(guardian, helper):
+    """
+    A service that fails its health check AND ignores SIGTERM must still be
+    restarted: guardian escalates to SIGKILL after GUARDIAN_STOP_TIMEOUT_MS.
+
+    Regression: the runtime stop path never escalated, so a hung process sat
+    in STOPPING forever and was never restarted. (On Windows, termination is
+    always forceful, so this passes quickly there.)
+
+    The health check probes 127.0.0.1:1, where nothing listens, so every
+    probe fails. This is also the first integration test that exercises
+    the health-check subsystem end to end.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t6")
+        log  = os.path.join(tmpdir, "t6.log").replace("\\", "/")
+        cfg  = write_config(tmpdir, "t6.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[hung-svc]
+command         = {helper}
+args            = ignore-term
+max_retries     = 0
+backoff_base_ms = 200
+stdout_log      = {log}
+
+[health_check]
+type                = tcp
+target              = 127.0.0.1:1
+interval_s          = 1
+timeout_s           = 1
+unhealthy_threshold = 1
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("unhealthy service that ignores SIGTERM is killed and restarted")
+        deadline = time.time() + 15
+        restarted = False
+        row = None
+        while time.time() < deadline:
+            row = status_row(get_status(guardian, cfg), "hung-svc")
+            if row and row[3].isdigit() and int(row[3]) >= 1:
+                restarted = True
+                break
+            time.sleep(0.2)
+        ASSERT(restarted, f"service was never restarted; last status row: {row}")
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
@@ -493,6 +547,7 @@ def main():
     test_max_retries_leads_to_failed(guardian, helper)
     test_restart_never_stays_stopped(guardian, helper)
     test_stop_command_exits_cleanly(guardian, helper)
+    test_unhealthy_hung_service_is_restarted(guardian, helper)
 
     ok = SUMMARY()
     sys.exit(0 if ok else 1)

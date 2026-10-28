@@ -224,7 +224,8 @@ void service_stop(SupervisorContext *ctx, int index) {
     LOG_INFO(svc->cfg.name, "Stopping (PID %lu)", (unsigned long)svc->rt.pid);
 
     platform_terminate(svc->rt.pid, svc->rt.process_handle);
-    svc->rt.state = STATE_STOPPING;
+    svc->rt.state             = STATE_STOPPING;
+    svc->rt.stop_requested_ms = platform_now_ms();
 
     /*
      * We don't wait here for the process to actually exit.

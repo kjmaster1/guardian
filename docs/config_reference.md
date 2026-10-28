@@ -99,6 +99,8 @@ to that service. Each service may have at most one health check.
 | `unhealthy_threshold` | int | `3` | Consecutive failures before triggering a restart |
 
 Only probes taken while the service is `RUNNING` count towards the threshold.
+When the threshold is reached guardian asks the process to stop; if it is still
+alive 5 seconds later it is force-killed, then restarted with the normal backoff.
 
 ### Type: tcp
 

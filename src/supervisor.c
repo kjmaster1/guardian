@@ -187,6 +187,21 @@ static void supervisor_tick(SupervisorContext *ctx) {
 
                 if (status.exited) {
                     handle_exited_service(ctx, i, status);
+                } else if (svc->rt.state == STATE_STOPPING &&
+                           now - svc->rt.stop_requested_ms >= GUARDIAN_STOP_TIMEOUT_MS) {
+                    /*
+                     * We asked it to stop and it ignored us. Health checks
+                     * exist precisely for hung processes, and a hung process
+                     * often never gets round to handling SIGTERM. Without
+                     * this escalation it stayed in STOPPING forever and was
+                     * never restarted. SIGKILL cannot be ignored; the next
+                     * tick reaps it and handle_exited_service() takes over.
+                     */
+                    LOG_WARN(svc->cfg.name,
+                             "Did not stop within %ds — force killing",
+                             GUARDIAN_STOP_TIMEOUT_MS / 1000);
+                    platform_kill(svc->rt.pid, svc->rt.process_handle);
+                    svc->rt.stop_requested_ms = now;  /* don't re-kill every tick */
                 } else if (svc->rt.state == STATE_STARTING) {
                     /*
                      * Still alive and in STARTING state.
@@ -259,13 +274,13 @@ static void supervisor_stop_all(SupervisorContext *ctx) {
     }
 
     /*
-     * Second pass: wait up to 5 seconds for each service to exit.
+     * Second pass: wait up to GUARDIAN_STOP_TIMEOUT_MS for services to exit.
      *
      * We poll in 100ms increments. This is a simple approach — a production
      * implementation would use WaitForMultipleObjects (Windows) or poll/select
      * (Linux) to wait on all processes simultaneously rather than sequentially.
      */
-    int max_wait_ms = 5000;
+    int max_wait_ms = GUARDIAN_STOP_TIMEOUT_MS;
     int waited_ms   = 0;
 
     while (waited_ms < max_wait_ms) {
@@ -300,10 +315,13 @@ static void supervisor_stop_all(SupervisorContext *ctx) {
         Service *svc = &ctx->services[i];
         if (svc->rt.state == STATE_STOPPING) {
             LOG_WARN(svc->cfg.name,
-                     "Did not stop within 5s — force killing");
+                     "Did not stop within %ds — force killing",
+                     GUARDIAN_STOP_TIMEOUT_MS / 1000);
             platform_kill(svc->rt.pid, svc->rt.process_handle);
             platform_close_handle(svc->rt.process_handle);
-            svc->rt.state = STATE_STOPPED;
+            svc->rt.process_handle = PLATFORM_INVALID_HANDLE;
+            svc->rt.state          = STATE_STOPPED;
+            svc->rt.pid            = PLATFORM_INVALID_PID;
         }
     }
 }

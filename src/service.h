@@ -30,6 +30,11 @@
 #define GUARDIAN_MAX_ENV_STR      256
 #define GUARDIAN_HEALTH_QUEUE_CAP 128
 
+/* How long a service gets to exit after a terminate request before it is
+ * force-killed. Applies both at runtime (health-triggered restarts) and
+ * during guardian shutdown. */
+#define GUARDIAN_STOP_TIMEOUT_MS 5000
+
 /* ==========================================================================
  * Enumerations
  * ==========================================================================
@@ -113,6 +118,7 @@ typedef struct {
     int64_t        next_restart_ms;
     int64_t        started_at_ms;
     int64_t        last_health_check_ms;
+    int64_t        stop_requested_ms;      /* when service_stop() was called */
     int            last_exit_code;
     int            killed_by_signal;
     int            health_triggered_stop;  /* 1 = this stop was from a health check */
