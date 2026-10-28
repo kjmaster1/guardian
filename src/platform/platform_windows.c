@@ -26,6 +26,7 @@
 #include <stdio.h>     /* fprintf, stderr, snprintf */
 #include <string.h>    /* memset, strncpy, strlen   */
 #include <stdlib.h>    /* malloc, free               */
+#include <ctype.h>     /* toupper                    */
 
 /* ==========================================================================
  * Argument string helpers
@@ -132,6 +133,76 @@ static void ensure_job_object(void) {
 }
 
 /* ==========================================================================
+ * Environment block for CreateProcess
+ *
+ * On Linux the child calls setenv() between fork() and exec(). Windows has
+ * no fork, so instead we hand CreateProcess a complete environment:
+ *   "KEY=VALUE\0KEY2=VALUE2\0...\0\0"
+ * built from guardian's own environment plus the service's env vars.
+ * (This used to be skipped entirely — 'env =' was silently ignored on
+ * Windows even though the docs say it works.)
+ * ==========================================================================
+ */
+
+/* Does the inherited entry "NAME=..." have the same NAME as any override?
+ * Windows variable names are case-insensitive. Entries such as "=C:=C:\x"
+ * (hidden per-drive directories) start with '=', so the name search
+ * begins at the second character. */
+static int env_is_overridden(const char *entry, const char **env_vars, int env_count) {
+    const char *eq = strchr(entry + 1, '=');
+    size_t name_len = eq ? (size_t)(eq - entry) : strlen(entry);
+
+    for (int i = 0; i < env_count; i++) {
+        const char *ov = env_vars[i];
+        if (strlen(ov) <= name_len || ov[name_len] != '=') continue;
+        size_t j = 0;
+        while (j < name_len &&
+               toupper((unsigned char)ov[j]) == toupper((unsigned char)entry[j])) {
+            j++;
+        }
+        if (j == name_len) return 1;
+    }
+    return 0;
+}
+
+/* Returns a malloc'd environment block (caller frees), or NULL on failure. */
+static char *build_env_block(const char **env_vars, int env_count) {
+    char *parent = GetEnvironmentStringsA();
+    if (parent == NULL) return NULL;
+
+    /* Pass 1: measure. Each entry is a NUL-terminated string; the block
+     * ends with an empty string (a second NUL). */
+    size_t total = 1;
+    for (const char *p = parent; *p; p += strlen(p) + 1) total += strlen(p) + 1;
+    for (int i = 0; i < env_count; i++) total += strlen(env_vars[i]) + 1;
+
+    char *block = malloc(total);
+    if (block == NULL) {
+        FreeEnvironmentStringsA(parent);
+        return NULL;
+    }
+
+    /* Pass 2: copy inherited entries that aren't overridden, then ours. */
+    char *out = block;
+    for (const char *p = parent; *p; p += strlen(p) + 1) {
+        if (env_is_overridden(p, env_vars, env_count)) continue;
+        size_t n = strlen(p) + 1;
+        memcpy(out, p, n);
+        out += n;
+    }
+    for (int i = 0; i < env_count; i++) {
+        if (strchr(env_vars[i], '=') == NULL) continue;  /* not KEY=VALUE */
+        size_t n = strlen(env_vars[i]) + 1;
+        memcpy(out, env_vars[i], n);
+        out += n;
+    }
+    *out = '\0';
+
+    FreeEnvironmentStringsA(parent);
+    return block;
+}
+
+/* ==========================================================================
  * platform_spawn — launch a child process
  *
  * This is the Windows equivalent of fork() + exec().
@@ -149,9 +220,6 @@ SpawnResult platform_spawn(const char  *command,
     memset(&result, 0, sizeof(result));
     result.pid    = PLATFORM_INVALID_PID;
     result.handle = PLATFORM_INVALID_HANDLE;
-
-    /* Suppress unused warning — env vars support comes in a later step */
-    (void)env_vars; (void)env_count;
 
     ensure_job_object();
 
@@ -281,7 +349,7 @@ SpawnResult platform_spawn(const char  *command,
      *   bInheritHandles:      TRUE — child inherits our open handles (the log files)
      *   dwCreationFlags:      CREATE_NO_WINDOW — don't open a console window
      *                         for background services
-     *   lpEnvironment:        NULL — inherit guardian's environment for now
+     *   lpEnvironment:        our env block, or NULL to inherit guardian's
      *   lpCurrentDirectory:   working_dir, or NULL to inherit guardian's cwd
      *   lpStartupInfo:        our STARTUPINFOA struct
      *   lpProcessInformation: Windows fills this with the new process's info
@@ -294,6 +362,18 @@ SpawnResult platform_spawn(const char  *command,
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
 
+    char *env_block = NULL;
+    if (env_vars && env_count > 0) {
+        env_block = build_env_block(env_vars, env_count);
+        if (env_block == NULL) {
+            if (h_stdout != INVALID_HANDLE_VALUE) CloseHandle(h_stdout);
+            if (h_stderr != INVALID_HANDLE_VALUE) CloseHandle(h_stderr);
+            snprintf(result.error_msg, sizeof(result.error_msg),
+                     "failed to build environment block");
+            return result;
+        }
+    }
+
     BOOL ok = CreateProcessA(
         NULL,
         cmd_line,
@@ -301,11 +381,13 @@ SpawnResult platform_spawn(const char  *command,
         NULL,
         TRUE,                /* bInheritHandles — must be TRUE for log redirection */
         CREATE_NO_WINDOW,
-        NULL,
+        env_block,
         (working_dir && working_dir[0]) ? working_dir : NULL,
         &si,
         &pi
     );
+    DWORD create_err = ok ? 0 : GetLastError();  /* before free() can change it */
+    free(env_block);
 
     /* Close the log file handles in the PARENT — we don't need them here.
      * The child has its own copies (inherited). If we don't close ours,
@@ -316,7 +398,7 @@ SpawnResult platform_spawn(const char  *command,
     if (!ok) {
         snprintf(result.error_msg, sizeof(result.error_msg),
                  "CreateProcess failed for '%s' (error %lu)",
-                 command, GetLastError());
+                 command, create_err);
         return result;
     }
 

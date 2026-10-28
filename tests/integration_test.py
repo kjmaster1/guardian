@@ -562,6 +562,49 @@ stdout_log = {log}
         if proc:
             stop_guardian(guardian, cfg, proc)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_env_vars_reach_child(guardian, helper):
+    """
+    'env = KEY=VALUE' must be visible to the managed process.
+
+    Regression: platform_windows.c ignored env_vars entirely, so this
+    setting silently did nothing on Windows.
+    """
+    tmpdir = tempfile.mkdtemp()
+    proc = None
+    try:
+        sock = make_ipc_socket(tmpdir, "t8")
+        log  = os.path.join(tmpdir, "t8.log").replace("\\", "/")
+        cfg  = write_config(tmpdir, "t8.ini", f"""\
+[supervisor]
+ipc_socket = {sock}
+
+[env-svc]
+command    = {helper}
+args       = env GUARDIAN_TEST_VAR
+env        = GUARDIAN_TEST_VAR=hello-from-guardian
+stdout_log = {log}
+""")
+        proc = start_guardian(guardian, cfg)
+
+        TEST("env var from config is set in the child process")
+        expected = "GUARDIAN_TEST_VAR=hello-from-guardian"
+        deadline = time.time() + 5
+        content = ""
+        while time.time() < deadline:
+            if os.path.exists(log):
+                with open(log) as f:
+                    content = f.read()
+                if expected in content:
+                    break
+            time.sleep(0.2)
+        ASSERT(expected in content, f"child printed: {content.strip()!r}")
+
+    finally:
+        if proc:
+            stop_guardian(guardian, cfg, proc)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
@@ -599,6 +642,7 @@ def main():
     test_stop_command_exits_cleanly(guardian, helper)
     test_unhealthy_hung_service_is_restarted(guardian, helper)
     test_second_instance_is_refused(guardian, helper)
+    test_env_vars_reach_child(guardian, helper)
 
     ok = SUMMARY()
     sys.exit(0 if ok else 1)
